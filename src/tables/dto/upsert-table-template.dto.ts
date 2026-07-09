@@ -45,52 +45,6 @@ export class TableSortDto {
   dir!: 'asc' | 'desc';
 }
 
-export class AuditIncrementalDto {
-  @IsString()
-  updatedAtField!: string;
-
-  @IsString()
-  sinceParam!: string;
-
-  @IsOptional()
-  @IsIn(['query', 'body'])
-  sinceIn?: 'query' | 'body';
-
-  @IsOptional()
-  @IsIn(['iso', 'epoch_ms', 'epoch_s'])
-  sinceFormat?: 'iso' | 'epoch_ms' | 'epoch_s';
-}
-
-export class AuditConfigDto {
-  @IsString()
-  @MinLength(1)
-  connectionId!: string;
-
-  @IsIn(['GET', 'POST'])
-  method!: 'GET' | 'POST';
-
-  @IsString()
-  @MinLength(1)
-  path!: string;
-
-  @IsOptional()
-  @IsObject()
-  query?: Record<string, string>;
-
-  @IsOptional()
-  @IsObject()
-  body?: Record<string, unknown>;
-
-  @IsOptional()
-  @IsString()
-  recordsPath?: string;
-
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => AuditIncrementalDto)
-  incremental?: AuditIncrementalDto;
-}
-
 export class BatchConfigDto {
   @IsArray()
   @ArrayMinSize(1)
@@ -101,6 +55,11 @@ export class BatchConfigDto {
   @IsInt()
   @Min(1)
   maxBatchSize?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  maxRecordsPerPoll?: number;
 }
 
 export class WriteConfigDto {
@@ -145,11 +104,7 @@ export class UpsertTableTemplateDto {
   @IsString()
   description?: string;
 
-  @IsOptional()
-  @IsBoolean()
-  perConnection?: boolean;
-
-  /** When perConnection, the source-connection ids this table is exposed on. */
+  /** The source-connection ids this table is exposed on. Empty/omitted = all connections. */
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
@@ -168,12 +123,6 @@ export class UpsertTableTemplateDto {
   @ValidateNested()
   @Type(() => TableSortDto)
   defaultSort?: TableSortDto;
-
-  /** Present to make this table pull/audit an external source by paging it. */
-  @IsOptional()
-  @ValidateNested()
-  @Type(() => AuditConfigDto)
-  audit?: AuditConfigDto;
 
   /** Present to push edited rows back to an external source. */
   @IsOptional()

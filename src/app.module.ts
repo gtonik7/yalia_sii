@@ -13,7 +13,6 @@ import { CapabilitiesModule } from './capabilities/capabilities.module';
 import { DatasetsModule } from './datasets/datasets.module';
 import { TablesModule } from './tables/tables.module';
 import { ConnectionsModule } from './connections/connections.module';
-import { AuditModule } from './audit/audit.module';
 import { CallbacksModule } from './callbacks/callbacks.module';
 import type { Env } from './config/env';
 
@@ -73,7 +72,6 @@ import type { Env } from './config/env';
     DatasetsModule,
     TablesModule,
     ConnectionsModule,
-    AuditModule,
     AnnounceModule,
     CallbacksModule,
   ],

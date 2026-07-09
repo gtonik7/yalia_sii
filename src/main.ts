@@ -19,7 +19,7 @@ async function bootstrap() {
       forceCloseConnections: true,
       bodyLimit: 10 * 1024 * 1024,
     }),
-    // rawBody:true es obligatorio para verificar el HMAC del callback de AEAT
+    // rawBody:true es obligatorio para verificar el HMAC del callback de SII
     // (src/callbacks) — sin esto el body llega ya parseado y la firma no coincide.
     { rawBody: true },
   );

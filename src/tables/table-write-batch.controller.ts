@@ -22,10 +22,9 @@ class TriggerBatchSubmitDto {
   trigger?: 'schedule' | 'manual';
 
   /**
-   * Source connection to scope the sweep to, for perConnection tables — the
-   * hub forwards this verbatim from the Flow origin's `connectionId`, the
-   * same field already used to filter every other hub-scheduled operation.
-   * Ignored for tables that aren't perConnection.
+   * Source connection to scope the sweep to — the hub forwards this verbatim
+   * from the Flow origin's `connectionId`, the same field already used to
+   * filter every other hub-scheduled operation.
    */
   @IsString()
   @IsOptional()
@@ -33,12 +32,11 @@ class TriggerBatchSubmitDto {
 }
 
 /**
- * Triggerable-operation contract (hub = scheduler), schedule-mode counterpart
- * to `table.audit.poll`:
+ * Triggerable-operation contract (hub = scheduler):
  *   POST /v1/operations/table.write.batchSubmit/trigger { params:{ tableKey }, connectionId }
  * → 202. Sweeps every `queued` row of the template (optionally scoped to one
- * connection on a perConnection table), partitioned by `write.batch.groupBy`,
- * one outbound submitGroup() call per partition/chunk.
+ * connection), partitioned by `write.batch.groupBy`, one outbound
+ * submitGroup() call per partition/chunk.
  */
 @UseGuards(MgmtTokenGuard)
 @Controller('v1/operations/table.write.batchSubmit')

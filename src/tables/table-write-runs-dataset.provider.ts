@@ -2,15 +2,14 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { DatasetRegistryService } from '../datasets/dataset-registry.service';
-import type { DatasetDescriptor, DatasetPage, DatasetProvider, DatasetQuery } from '../datasets/dataset.types';
+import type { DatasetDeleteParams, DatasetDescriptor, DatasetPage, DatasetProvider, DatasetQuery } from '../datasets/dataset.types';
 import { TableWriteRun } from './entities/table-write-run.entity';
 
 /**
  * Exposes the outbound-submission (write) run history as a dataset so it shows
- * up in the explorer next to the tables themselves (no FE changes needed —
- * mirrors SourcePollRunsDatasetProvider on the pull side). This is the
- * operator's "estado de los envíos": what was submitted, when, by which
- * trigger, and whether the provider ACKed it.
+ * up in the explorer next to the tables themselves (no FE changes needed).
+ * This is the operator's "estado de los envíos": what was submitted, when, by
+ * which trigger, and whether the provider ACKed it.
  */
 @Injectable()
 export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleInit {
@@ -19,17 +18,17 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     label: 'Ejecuciones de escritura',
     description: 'Historial de lotes salientes de presentación al sistema externo',
     perConnection: false,
+    deletable: true,
     columns: [
       { key: 'createdAt', label: 'Inicio', type: 'date', sortable: true },
+      { key: 'completedAt', label: 'Fin', type: 'date' },
+      { key: 'status', label: 'Estado', type: 'string', filterable: true },
       { key: 'tableKey', label: 'Tabla', type: 'string', filterable: true },
       { key: 'connectionName', label: 'Conexión', type: 'string' },
       { key: 'trigger', label: 'Disparador', type: 'string', filterable: true },
-      { key: 'status', label: 'Estado', type: 'string', filterable: true },
       { key: 'rowCount', label: 'Filas', type: 'number' },
       { key: 'httpStatus', label: 'HTTP', type: 'number' },
       { key: 'batchId', label: 'Batch', type: 'string' },
-      { key: 'errorMessage', label: 'Error', type: 'string' },
-      { key: 'completedAt', label: 'Fin', type: 'date' },
     ],
     filters: [
       {
@@ -77,10 +76,29 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
       .getManyAndCount();
 
     return {
-      rows: rows as unknown as Record<string, unknown>[],
+      // La ficha genérica del explorer (checkbox/selección/borrado) se
+      // engancha por `_id`, no por la PK real de la entidad (`id`).
+      rows: rows.map((r) => ({ ...r, _id: r.id })) as unknown as Record<string, unknown>[],
       total,
       page: params.page,
       pageSize: params.pageSize,
     };
+  }
+
+  async deleteRows(params: DatasetDeleteParams): Promise<{ affected: number }> {
+    const qb = this.repo.createQueryBuilder().delete();
+
+    if (params.ids && params.ids.length > 0) {
+      qb.whereInIds(params.ids);
+    } else if (params.olderThanDays) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - params.olderThanDays);
+      qb.where('createdAt < :cutoff', { cutoff });
+    } else {
+      return { affected: 0 };
+    }
+
+    const result = await qb.execute();
+    return { affected: result.affected ?? 0 };
   }
 }

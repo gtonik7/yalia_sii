@@ -35,21 +35,13 @@ const envSchema = z.object({
 
   /**
    * 32-byte hex key used to AES-256-GCM the source-connection credentials.
-   * Required only when audit/polling connections are configured; the crypto
-   * helper throws at use time if a connection needs it and it is unset.
+   * Required only when a connection with encrypted credentials is configured;
+   * the crypto helper throws at use time if a connection needs it and it is unset.
    */
   CREDENTIALS_ENC_KEY: z
     .string()
     .regex(/^[0-9a-fA-F]{64}$/, 'CREDENTIALS_ENC_KEY must be 32 bytes hex (64 chars)')
     .optional(),
-
-  /**
-   * Shared secret for HMAC-SHA256-signing the inbound AEAT-result callback
-   * (unguarded — no MgmtTokenGuard, since the caller is the external vendor,
-   * not the hub). Optional in the schema, but the callback controller refuses
-   * every request (401) while it's unset — fails closed, not open.
-   */
-  AEAT_CALLBACK_HMAC_SECRET: z.string().min(16).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

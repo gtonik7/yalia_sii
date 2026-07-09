@@ -27,6 +27,8 @@ export class TableWriteRunService {
     rowCount: number;
     httpStatus?: number | null;
     errorMessage?: string | null;
+    payloadPreview?: unknown;
+    responseBody?: unknown;
   }): Promise<TableWriteRun> {
     return this.repo.save(this.repo.create({ ...data, completedAt: new Date() }));
   }

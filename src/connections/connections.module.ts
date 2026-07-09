@@ -7,9 +7,9 @@ import { SourceAuthService } from './source-auth.service';
 import { SourceHttpClient } from './source-http.client';
 
 /**
- * Manages external "source" connections (base URL + auth + pagination) and the
- * generic HTTP client the audit poller uses to read from them. Exported so the
- * audit module can resolve a connection and page over it.
+ * Manages external "source" connections (base URL + auth) and the generic
+ * HTTP client used to push outbound writes to them. Exported so the tables
+ * module (write submission, internal write cron) can resolve a connection.
  */
 @Module({
   imports: [TypeOrmModule.forFeature([SourceConnection])],

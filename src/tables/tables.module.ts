@@ -10,7 +10,8 @@ import { TableIndexManagerService } from './table-index-manager.service';
 import { TableTemplatesController } from './table-templates.controller';
 import { TableDatasetBridge } from './table-dataset.bridge';
 import { IngestTableOperation } from './ingest-table.operation';
-import { WriteSweepProcessor } from './write-sweep.processor';
+import { WriteEventProcessor } from './write-event.processor';
+import { WriteCronService } from './write-cron.service';
 import { TableWriteBatchService } from './table-write-batch.service';
 import { TableWriteBatchController } from './table-write-batch.controller';
 import { TableWriteSubmitController } from './table-write-submit.controller';
@@ -30,7 +31,7 @@ import { QUEUES } from '../core/queues/queues.constants';
     TypeOrmModule.forFeature([TableTemplate, TableRow, TableWriteRun]),
     OperationRegistryModule,
     ConnectionsModule,
-    BullModule.registerQueue({ name: QUEUES.WRITE_SWEEP }),
+    BullModule.registerQueue({ name: QUEUES.WRITE_EVENT }),
   ],
   controllers: [TableTemplatesController, TableWriteBatchController, TableWriteSubmitController],
   providers: [
@@ -39,7 +40,8 @@ import { QUEUES } from '../core/queues/queues.constants';
     TableIndexManagerService,
     TableDatasetBridge,
     IngestTableOperation,
-    WriteSweepProcessor,
+    WriteEventProcessor,
+    WriteCronService,
     TableWriteBatchService,
     TableWriteRunService,
     TableWriteRunsDatasetProvider,

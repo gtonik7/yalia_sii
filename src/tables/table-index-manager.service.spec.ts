@@ -46,7 +46,6 @@ function makeTemplate(over: Partial<TableTemplate>): TableTemplate {
   return {
     key: 'emitidas-idx-test',
     label: 'Emitidas',
-    perConnection: false,
     idField: '',
     columns: [
       { key: 'counterpartyTaxId', label: 'NIF', type: 'string' },

@@ -68,8 +68,9 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
       key: t.key,
       label: t.label,
       description: t.description ?? undefined,
-      perConnection: t.perConnection,
-      connectionIds: t.perConnection && t.connectionIds?.length ? t.connectionIds : undefined,
+      // Every yalia_sii table's rows are classified by connectionId.
+      perConnection: true,
+      connectionIds: t.connectionIds?.length ? t.connectionIds : undefined,
       columns: t.columns.map((c) => ({
         key: c.key,
         label: c.label,
@@ -80,6 +81,7 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
       filters: filters.length ? filters : undefined,
       defaultSort: t.defaultSort ?? undefined,
       editable: t.write ? true : undefined,
+      deletable: true,
       // Las tablas de usuario se operan desde la pestaña "Registros" del
       // satélite, no desde el Explorer global (donde sí quedan los datasets de
       // diagnóstico: historial de polls/envíos).

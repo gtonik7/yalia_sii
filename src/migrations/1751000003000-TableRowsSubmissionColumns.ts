@@ -1,16 +1,16 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
 /**
- * Añade el estado de presentación AEAT a `table_rows` (unificado en la misma
+ * Añade el estado de presentación SII a `table_rows` (unificado en la misma
  * fila que el resto del ciclo de vida de escritura — ver el plan del pipeline
- * SII/AEAT: no existe una tabla "sii-azure" separada).
+ * SII: no existe una tabla "sii-azure" separada).
  *
  * `submission_status` es distinto de `write_status`: `write_status` es el ack
  * de transporte del envío saliente (llegó o no al sistema externo);
- * `submission_status` es el resultado real de AEAT, que llega después vía
+ * `submission_status` es el resultado real de SII, que llega después vía
  * callback y se correlaciona por `external_ref`. `batch_id` es solo para
  * trazabilidad/detección de lotes atascados, nunca para decidir el resultado
- * por fila. `aeat_response` guarda el último payload crudo del callback,
+ * por fila. `sii_response` guarda el último payload crudo del callback,
  * sobreescrito entero en cada respuesta (no hace falta histórico).
  *
  * También rellena `write.trigger = 'event'` en las templates existentes que ya
@@ -27,7 +27,7 @@ export class TableRowsSubmissionColumns1751000003000 implements MigrationInterfa
       ALTER TABLE "table_rows"
         ADD COLUMN "submission_status" varchar(16),
         ADD COLUMN "batch_id" varchar(64),
-        ADD COLUMN "aeat_response" jsonb;
+        ADD COLUMN "sii_response" jsonb;
     `);
 
     // El callback correlaciona por external_ref; hoy no hay ningún índice sobre esa columna.
@@ -55,7 +55,7 @@ export class TableRowsSubmissionColumns1751000003000 implements MigrationInterfa
     await q.query(`DROP INDEX IF EXISTS "ix_table_rows_external_ref";`);
     await q.query(`
       ALTER TABLE "table_rows"
-        DROP COLUMN IF EXISTS "aeat_response",
+        DROP COLUMN IF EXISTS "sii_response",
         DROP COLUMN IF EXISTS "batch_id",
         DROP COLUMN IF EXISTS "submission_status";
     `);

@@ -11,17 +11,17 @@ export function satelliteJobsQueueName(key: string = satelliteKey()): string {
   return `sat-${key}-jobs`;
 }
 
-/** Debounced sweep that turns `queued` rows of a batch group into one outbound submitGroup() call. */
-export function satelliteWriteSweepQueueName(key: string = satelliteKey()): string {
-  return `sat-${key}-write-sweep`;
+/** Immediate, row-targeted send of a single edited row (event mode) as an array of 1. */
+export function satelliteWriteEventQueueName(key: string = satelliteKey()): string {
+  return `sat-${key}-write-event`;
 }
 
 export const QUEUES = {
   JOBS: satelliteJobsQueueName(),
-  WRITE_SWEEP: satelliteWriteSweepQueueName(),
-  // Inbound AEAT-result callback: fixed name (not per-satellite-key) since this
+  WRITE_EVENT: satelliteWriteEventQueueName(),
+  // Inbound SII-result callback: fixed name (not per-satellite-key) since this
   // satellite's identity is permanently "sii" — mirrors the HUB_* queues below.
-  AEAT_INBOUND: 'sii-inbound-results',
+  SII_INBOUND: 'sii-inbound-results',
   HUB_CALLBACKS: 'hub-callbacks',
   HUB_EVENTS: 'hub-events',
   HUB_ANNOUNCE: 'hub-announce',

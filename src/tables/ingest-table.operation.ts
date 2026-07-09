@@ -54,15 +54,15 @@ export class IngestTableOperation implements OperationHandler, OnModuleInit {
       return err('EMPTY_PAYLOAD', 'No rows found in payload');
     }
 
-    if (template.perConnection && !ctx.connectionId) {
-      return err('MISSING_CONNECTION', `Template "${tableKey}" is perConnection but no connectionId was provided`);
+    if (!ctx.connectionId) {
+      return err('MISSING_CONNECTION', `No connectionId was provided for template "${tableKey}"`);
     }
 
-    // perConnection scopes the explorer's connection picker to registered
-    // source_connections (see TableDatasetBridge); a connectionId that isn't one
-    // of those would land rows nothing can ever select in the UI, so reject it
-    // here instead of silently accepting an unreachable row.
-    if (template.perConnection && ctx.connectionId && !(await this.connections.exists(ctx.connectionId))) {
+    // The explorer's connection picker is scoped to registered
+    // source_connections (see TableDatasetBridge); a connectionId that isn't
+    // one of those would land rows nothing can ever select in the UI, so
+    // reject it here instead of silently accepting an unreachable row.
+    if (!(await this.connections.exists(ctx.connectionId))) {
       return err('UNKNOWN_CONNECTION', `"${ctx.connectionId}" is not a registered source connection for template "${tableKey}"`);
     }
 

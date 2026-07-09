@@ -2,15 +2,15 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 
 
 /**
  * Summary of one outbound submission batch (one `submitGroup()` call = one HTTP
- * request to the external system for a group/chunk of `queued` rows). The
- * write-side analog of `SourcePollRun`: it lands in the explorer as the
- * `table-write-runs` dataset so the operator can see, per table, what was
- * submitted, when, by which trigger, and whether the provider ACKed it.
+ * request to the external system for a group/chunk of `queued` rows). It lands
+ * in the explorer as the `table-write-runs` dataset so the operator can see,
+ * per table, what was submitted, when, by which trigger, and whether the
+ * provider ACKed it.
  *
- * Unlike a poll run there is no live "running" phase to track: a batch is a
+ * There is no live "running" phase to track: a batch is a
  * single awaited HTTP call, so the row is written once with its terminal
  * outcome. `status='sent'` means the provider ACKed (2xx) and the rows moved to
- * `submission_status='pending'` awaiting the async AEAT callback; `status='error'`
+ * `submission_status='pending'` awaiting the async SII callback; `status='error'`
  * means a non-2xx/transport failure put them back to `queued` for retry.
  *
  * Kept a plain table (not a Timescale hypertable like `source_poll_runs`) — the
@@ -58,6 +58,14 @@ export class TableWriteRun {
 
   @Column({ type: 'text', name: 'error_message', nullable: true })
   errorMessage!: string | null;
+
+  /** The complete sent payload for audit and tracing purposes. */
+  @Column({ type: 'jsonb', name: 'payload_preview', nullable: true })
+  payloadPreview!: unknown;
+
+  /** External system's response body on a non-2xx/transport error — the detail behind the failure. */
+  @Column({ type: 'jsonb', name: 'response_body', nullable: true })
+  responseBody!: unknown;
 
   @Column({ type: 'timestamptz', name: 'completed_at', nullable: true })
   completedAt!: Date | null;

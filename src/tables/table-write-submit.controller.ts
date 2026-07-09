@@ -18,10 +18,7 @@ class SubmitRowsDto {
   @IsString({ each: true })
   ids!: string[];
 
-  /**
-   * Source connection to scope the selection to, for perConnection tables.
-   * Ignored for tables that aren't perConnection.
-   */
+  /** Source connection to scope the selection to. */
   @IsString()
   @IsOptional()
   connectionId?: string;

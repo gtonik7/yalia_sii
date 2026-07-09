@@ -3,13 +3,13 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { DataSource } from 'typeorm';
 import type { Queue } from 'bullmq';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { TableTemplate } from './entities/table-template.entity';
 import { DatasetDeleteParams, DatasetPage, DatasetQuery, DatasetUpdateResult } from '../datasets/dataset.types';
-import { SourceConnectionsService } from '../connections/source-connections.service';
+import { resolveClave, SourceConnectionsService } from '../connections/source-connections.service';
 import { SourceHttpClient } from '../connections/source-http.client';
 import { QUEUES, DEFAULT_JOB_OPTS } from '../core/queues/queues.constants';
-import { WriteSweepJobData } from './write-sweep.types';
+import { WriteEventJobData } from './write-event.types';
 import { TableWriteRunService } from './table-write-run.service';
 import { assertColumnKey, assertTableKey, escapeLike, isUuid, ParamList, sqlStringLiteral } from '../core/sql/sql-params.util';
 
@@ -23,7 +23,7 @@ interface TableRowRow {
   last_written_at: Date | null;
   external_ref: string | null;
   submission_status: string | null;
-  aeat_response: Record<string, unknown> | null;
+  sii_response: Record<string, unknown> | null;
 }
 
 @Injectable()
@@ -32,7 +32,7 @@ export class TableRowsService {
     @InjectDataSource() private readonly dataSource: DataSource,
     private readonly connections: SourceConnectionsService,
     private readonly client: SourceHttpClient,
-    @InjectQueue(QUEUES.WRITE_SWEEP) private readonly writeSweep: Queue<WriteSweepJobData>,
+    @InjectQueue(QUEUES.WRITE_EVENT) private readonly writeEvent: Queue<WriteEventJobData>,
     private readonly writeRuns: TableWriteRunService,
   ) {}
 
@@ -48,7 +48,6 @@ export class TableRowsService {
   ): Promise<{ inserted: number; upserted: number }> {
     let inserted = 0;
     let upserted = 0;
-    const scope = template.perConnection ? connectionId : '';
     const affected: { id: string; data: Record<string, unknown> }[] = [];
 
     if (template.idField) {
@@ -68,7 +67,7 @@ export class TableRowsService {
           // No id present → fall back to insert so the row is not lost.
           const [{ id }]: { id: string }[] = await this.dataSource.query(
             `INSERT INTO table_rows (table_key, connection_id, data, trace_id) VALUES ($1, $2, $3::jsonb, $4) RETURNING id`,
-            [template.key, scope, JSON.stringify(data), traceId ?? null],
+            [template.key, connectionId, JSON.stringify(data), traceId ?? null],
           );
           affected.push({ id, data });
           inserted++;
@@ -80,7 +79,7 @@ export class TableRowsService {
            ON CONFLICT (connection_id, ${idExpr}) WHERE table_key = ${tableKeyLit}
            DO UPDATE SET data = EXCLUDED.data, trace_id = EXCLUDED.trace_id
            RETURNING id`,
-          [template.key, scope, JSON.stringify(data), traceId ?? null],
+          [template.key, connectionId, JSON.stringify(data), traceId ?? null],
         );
         affected.push({ id, data });
         upserted++;
@@ -92,7 +91,7 @@ export class TableRowsService {
         rows.forEach((data, idx) => {
           const base = idx * 4;
           values.push(`($${base + 1}, $${base + 2}, $${base + 3}::jsonb, $${base + 4})`);
-          params.push(template.key, scope, JSON.stringify(data), traceId ?? null);
+          params.push(template.key, connectionId, JSON.stringify(data), traceId ?? null);
         });
         const returned: { id: string }[] = await this.dataSource.query(
           `INSERT INTO table_rows (table_key, connection_id, data, trace_id) VALUES ${values.join(',')} RETURNING id`,
@@ -105,7 +104,11 @@ export class TableRowsService {
       inserted += rows.length;
     }
 
-    await this.markQueuedAndScheduleSweep(template, affected, template.perConnection ? connectionId : null);
+    // Creation never sends — rows land `queued` and wait for the per-connection
+    // internal cron (or an explicit force-submit). Only an *edit* (updateAndWrite)
+    // triggers an immediate event send. Rows are created in batch, so a send here
+    // would be a batch-on-create, which is exactly what we don't want.
+    await this.markQueued(template, affected.map((r) => r.id));
 
     return { inserted, upserted };
   }
@@ -117,7 +120,7 @@ export class TableRowsService {
 
     const p = new ParamList();
     const where: string[] = [`table_key = ${p.push(template.key)}`];
-    if (template.perConnection) where.push(`connection_id = ${p.push(params.connectionId ?? '')}`);
+    where.push(`connection_id = ${p.push(params.connectionId ?? '')}`);
 
     const dateRangeBounds = new Map<string, { from?: string; until?: string }>();
 
@@ -184,7 +187,7 @@ export class TableRowsService {
 
     const [rows, countRows] = await Promise.all([
       this.dataSource.query(
-        `SELECT id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, aeat_response
+        `SELECT id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, sii_response
          FROM table_rows WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ${limitPh} OFFSET ${offsetPh}`,
         p.all,
       ) as Promise<TableRowRow[]>,
@@ -204,7 +207,7 @@ export class TableRowsService {
         _lastWrittenAt: r.last_written_at,
         _externalRef: r.external_ref,
         _submissionStatus: r.submission_status,
-        _aeatResponse: r.aeat_response,
+        _siiResponse: r.sii_response,
       })),
       total: countRows[0].total,
       page: params.page,
@@ -215,7 +218,7 @@ export class TableRowsService {
   async deleteRows(template: TableTemplate, params: DatasetDeleteParams): Promise<{ affected: number }> {
     const p = new ParamList();
     const where: string[] = [`table_key = ${p.push(template.key)}`];
-    if (template.perConnection && params.connectionId) where.push(`connection_id = ${p.push(params.connectionId)}`);
+    if (params.connectionId) where.push(`connection_id = ${p.push(params.connectionId)}`);
 
     if (params.ids?.length) {
       const validIds = params.ids.filter(isUuid);
@@ -244,7 +247,7 @@ export class TableRowsService {
    * must persist even if queuing somehow fails, so the user doesn't lose
    * their correction (optimistic local update). The external push itself is
    * never inline here: even a single-row "event" submission can be slow
-   * enough on the AEAT side to risk an HTTP timeout, so every write funnels
+   * enough on the SII side to risk an HTTP timeout, so every write funnels
    * through the same queued/debounced path as a batch of one (see
    * `submitGroup`/`WriteSweepProcessor`) — there is no synchronous code path.
    */
@@ -259,12 +262,12 @@ export class TableRowsService {
     const p = new ParamList();
     const dataPh = p.push(JSON.stringify(data));
     const where: string[] = [`id = ${p.push(rowId)}`, `table_key = ${p.push(template.key)}`];
-    if (template.perConnection && connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
+    if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
 
     // UPDATE returns [rows, rowCount] via TypeORM's raw query() — see deleteRows().
     const [rows]: [TableRowRow[], number] = await this.dataSource.query(
       `UPDATE table_rows SET data = ${dataPh}::jsonb WHERE ${where.join(' AND ')}
-       RETURNING id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, aeat_response`,
+       RETURNING id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, sii_response`,
       p.all,
     );
     const updated = rows[0];
@@ -280,26 +283,35 @@ export class TableRowsService {
       _lastWrittenAt: updated.last_written_at,
       _externalRef: updated.external_ref,
       _submissionStatus: updated.submission_status,
-      _aeatResponse: updated.aeat_response,
+      _siiResponse: updated.sii_response,
     });
 
     if (!template.write) return { row: flatten() };
 
-    await this.markQueuedAndScheduleSweep(template, [{ id: updated.id, data: updated.data }], template.perConnection ? (connectionId ?? null) : null);
-    // markQueuedAndScheduleSweep() updates the DB but not this in-memory row —
-    // reflect the same fresh-attempt reset here so the response isn't stale.
+    const rowConnectionId = connectionId ?? null;
+    await this.markQueued(template, [updated.id]);
+    // Event mode: send exactly this edited row now (array of 1), via an immediate
+    // targeted job — never inline (an SII round-trip can outlast the form-save
+    // HTTP request). Schedule mode: leave it `queued` for the internal cron.
+    if ((template.write.trigger ?? 'event') === 'event') {
+      await this.enqueueEventSend(template.key, updated.id, rowConnectionId);
+    }
+    // markQueued() updates the DB but not this in-memory row — reflect the same
+    // fresh-attempt reset here so the response isn't stale.
     updated.submission_status = 'queued';
-    updated.aeat_response = null;
+    updated.sii_response = null;
     return { row: flatten(), external: { attempted: true, status: 'queued' } };
   }
 
   /**
-   * Send one outbound batch (one HTTP call, whole array as the body) for rows
-   * already queued for submission, and record the transport ack for all of
-   * them in a single UPDATE. Never touches `data` and never resolves the real
-   * AEAT result — that only ever arrives later via the inbound callback,
-   * correlated by `external_ref`. `batch_id` here is purely for
-   * traceability/stuck-batch detection, never for deciding a per-row outcome.
+   * Send one outbound batch (one HTTP call, body `{clientId, payload}` — payload
+   * is ALWAYS an array, even for a single-row event send, and every row carries
+   * `internal_ref` = its own row id) for rows already queued for submission,
+   * and record the transport ack for all of them in a single UPDATE. Never
+   * touches `data` and never resolves the real SII result — that only ever
+   * arrives later via the inbound callback, correlated by the echoed-back
+   * `internal_ref`. `batch_id` here is purely for traceability/stuck-batch
+   * detection, never for deciding a per-row outcome.
    *
    * A 2xx is only a provider ACK ("received"), so rows move to
    * `submission_status='pending'` (awaiting the real result), never straight
@@ -320,36 +332,57 @@ export class TableRowsService {
     const ids = rows.map((r) => r.id);
     const trigger = opts?.trigger ?? template.write.trigger ?? 'event';
     const groupValues = opts?.groupValues ?? null;
-    // perConnection tables submit each group through the connection its rows
-    // were ingested under, not the template's single fixed write connection —
-    // otherwise every company/tenant's queued rows would ship through the same
-    // one regardless of which one they actually belong to.
-    const connectionId = template.perConnection && opts?.connectionId ? opts.connectionId : template.write.connectionId;
+    // Each group submits through the connection its rows were ingested under,
+    // not the template's single fixed write connection — otherwise every
+    // company/tenant's queued rows would ship through the same one regardless
+    // of which one they actually belong to. `template.write.connectionId` is
+    // only the fallback for when that can't be determined.
+    const connectionId = opts?.connectionId ?? template.write.connectionId;
     let connectionName: string | null = null;
+
+    // Payload is ALWAYS an array — a single-row event send still ships as an
+    // array of 1, per the external-system contract. Keys are normalized to
+    // camelCase for the outbound submission. `internal_ref` carries our own
+    // row id so the external system can echo it back on its result callback —
+    // that's what correlates the callback to a row, instead of relying on the
+    // vendor's own externalRefPath-plucked id.
+    const payload = rows.map((r) => ({
+      internal_ref: r.id,
+      ...(toCamelCase(r.data) as Record<string, unknown>),
+    }));
+    let payloadPreview: unknown;
 
     try {
       const conn = await this.connections.resolveById(connectionId);
       connectionName = conn.name;
-      const { status } = await this.client.send(
+      const clientId = resolveClave(conn);
+      payloadPreview = { clientId, payload };
+      const { status, data } = await this.client.send(
         conn,
         { method: template.write.method, path: template.write.path, query: template.write.query },
-        rows.map((r) => r.data),
+        payloadPreview,
       );
 
       if (status >= 200 && status < 300) {
         await this.markGroupResult(ids, batchId, 'sent', null, 'pending');
-        await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'sent', httpStatus: status, batchId });
+        await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'sent', httpStatus: status, batchId, payloadPreview });
         return { batchId, status: 'sent' };
       }
 
-      const message = `External system responded ${status}`;
+      // Detailed error: include the external system's response body, not just the
+      // bare status — "responded 400" alone is useless for diagnosing a rejection.
+      const message = `External system responded ${status}: ${truncate(safeStringify(data))}`;
       await this.markGroupResult(ids, batchId, 'error', message, 'queued');
-      await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'error', httpStatus: status, errorMessage: message, batchId });
+      await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'error', httpStatus: status, errorMessage: message, batchId, payloadPreview, responseBody: data ?? null });
       return { batchId, status: 'error', error: message };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // Transport failure (network/DNS/timeout): send() only throws here, since
+      // non-2xx responses are returned, not thrown (validateStatus always true).
+      const responseBody = axiosResponseBody(err);
+      const base = err instanceof Error ? err.message : String(err);
+      const message = responseBody !== null ? `${base}: ${truncate(safeStringify(responseBody))}` : base;
       await this.markGroupResult(ids, batchId, 'error', message, 'queued');
-      await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'error', httpStatus: null, errorMessage: message, batchId });
+      await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'error', httpStatus: null, errorMessage: message, batchId, payloadPreview, responseBody });
       return { batchId, status: 'error', error: message };
     }
   }
@@ -369,6 +402,8 @@ export class TableRowsService {
     httpStatus: number | null;
     errorMessage?: string;
     batchId?: string;
+    payloadPreview?: unknown;
+    responseBody?: unknown;
   }): Promise<void> {
     try {
       await this.writeRuns.record({
@@ -382,6 +417,8 @@ export class TableRowsService {
         rowCount: args.rowCount,
         httpStatus: args.httpStatus,
         errorMessage: args.errorMessage ?? null,
+        payloadPreview: args.payloadPreview ?? null,
+        responseBody: args.responseBody ?? null,
       });
     } catch {
       /* history is best-effort; a submission must never fail because of it */
@@ -404,60 +441,72 @@ export class TableRowsService {
   }
 
   /**
-   * Mark freshly ingested/edited rows as a fresh submission attempt
-   * (`submission_status='queued'`, clearing any stale `batch_id`/`aeat_response`
-   * from a previous attempt), then — only for `trigger==='event'` templates —
-   * enqueue one debounced sweep job per distinct batch group present among
-   * `affected`. No-op when the template has no `write` config.
+   * Mark rows as a fresh submission attempt (`submission_status='queued'`,
+   * clearing any stale `batch_id`/`sii_response` from a previous attempt).
+   * Never sends anything itself — creation waits for the internal cron, edits
+   * are pushed separately via `enqueueEventSend`. No-op when the template has
+   * no `write` config or there are no ids.
    */
-  private async markQueuedAndScheduleSweep(
-    template: TableTemplate,
-    affected: { id: string; data: Record<string, unknown> }[],
-    connectionId: string | null,
-  ): Promise<void> {
-    if (!template.write || !affected.length) return;
-
-    const ids = affected.map((r) => r.id);
+  private async markQueued(template: TableTemplate, ids: string[]): Promise<void> {
+    if (!template.write || !ids.length) return;
     await this.dataSource.query(
-      `UPDATE table_rows SET submission_status = 'queued', batch_id = NULL, aeat_response = NULL WHERE id = ANY($1::uuid[])`,
+      `UPDATE table_rows SET submission_status = 'queued', batch_id = NULL, sii_response = NULL WHERE id = ANY($1::uuid[])`,
       [ids],
     );
-
-    if ((template.write.trigger ?? 'event') !== 'event') return;
-
-    const groupBy = template.write.batch?.groupBy ?? [];
-    const seenGroups = new Set<string>();
-    for (const row of affected) {
-      const groupValues: Record<string, string> = {};
-      for (const col of groupBy) groupValues[col] = String(row.data[col] ?? '');
-      const dedupeKey = JSON.stringify(groupValues);
-      if (seenGroups.has(dedupeKey)) continue;
-      seenGroups.add(dedupeKey);
-      await this.enqueueWriteSweep(template.key, groupValues, connectionId);
-    }
   }
 
   /**
-   * Debounce a burst of concurrent inserts/edits on the same batch group into
-   * one sweep: a stable `jobId` per (tableKey, connectionId, groupValues) means
-   * BullMQ silently drops every `add()` call after the first while a job with
-   * that id is still waiting/delayed, so this relies entirely on the sweep
-   * re-querying `queued` rows at execution time rather than trusting
-   * `groupValues` as anything but a WHERE-clause key (see WriteSweepProcessor).
-   * `connectionId` is folded into the jobId too so two perConnection tenants
-   * sharing the same groupBy values never collapse into one debounce job.
+   * Enqueue an immediate, row-targeted send of a single edited row (event mode).
+   * `delay: 0` so it fires right away; a stable `jobId` per row dedupes rapid
+   * re-edits while one is still in flight. The processor re-checks the row is
+   * still `queued` before sending, so a stale/duplicate job simply no-ops.
    */
-  private async enqueueWriteSweep(tableKey: string, groupValues: Record<string, string>, connectionId: string | null): Promise<void> {
-    const hash = shortHash(`${tableKey}:${connectionId ?? ''}:${JSON.stringify(groupValues)}`);
-    const debounceMs = Number(process.env.WRITE_SWEEP_DEBOUNCE_MS) || 5000;
-    await this.writeSweep.add(
-      'sweep',
-      { tableKey, groupValues, connectionId },
-      { ...DEFAULT_JOB_OPTS, jobId: `write-sweep:${tableKey}:${hash}`, delay: debounceMs },
+  private async enqueueEventSend(tableKey: string, rowId: string, connectionId: string | null): Promise<void> {
+    await this.writeEvent.add(
+      'event',
+      { tableKey, rowId, connectionId },
+      { ...DEFAULT_JOB_OPTS, jobId: `write-event-${rowId}`, delay: 0 },
     );
   }
 }
 
-function shortHash(input: string): string {
-  return createHash('sha256').update(input).digest('hex').slice(0, 16);
+/** Convert snake_case keys to camelCase recursively. */
+function toCamelCase(obj: unknown): unknown {
+  if (Array.isArray(obj)) {
+    return obj.map(toCamelCase);
+  }
+  if (obj !== null && typeof obj === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      const camelKey = key.replace(/_([a-z])/g, (_, char) => char.toUpperCase());
+      result[camelKey] = toCamelCase(value);
+    }
+    return result;
+  }
+  return obj;
+}
+
+/** JSON.stringify that never throws (circular refs → fallback to String()). */
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** Cap an error/response snippet so a huge body never bloats the run history. */
+function truncate(s: string, max = 2000): string {
+  return s.length > max ? `${s.slice(0, max)}… (${s.length} chars)` : s;
+}
+
+/** Pull `response.data` out of an axios-style error, or null if there's none. */
+function axiosResponseBody(err: unknown): unknown {
+  if (err && typeof err === 'object' && 'response' in err) {
+    const response = (err as { response?: unknown }).response;
+    if (response && typeof response === 'object' && 'data' in response) {
+      return (response as { data?: unknown }).data ?? null;
+    }
+  }
+  return null;
 }

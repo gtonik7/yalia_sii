@@ -17,6 +17,7 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn } from 
  */
 @Entity('table_rows')
 @Index(['tableKey', 'connectionId', 'createdAt'])
+@Index(['tableKey', 'connectionId', 'externalRef'], { where: '"externalRef" IS NOT NULL' })
 export class TableRow {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -25,7 +26,7 @@ export class TableRow {
   @Column({ type: 'varchar', length: 128, name: 'table_key' })
   tableKey!: string;
 
-  /** Optional tenant scope when the template is perConnection. */
+  /** Tenant scope: the connection this row was ingested under. */
   @Column({ type: 'varchar', length: 64, name: 'connection_id', default: '' })
   connectionId!: string;
 
@@ -51,11 +52,11 @@ export class TableRow {
   externalRef!: string | null;
 
   /**
-   * Real AEAT outcome of the last submission attempt (distinct from
+   * Real SII outcome of the last submission attempt (distinct from
    * `writeStatus`, which is only the transport ack of the outbound call).
    * `null` = not applicable (no `write` configured, or never submitted).
    * `'queued'` = edited/ingested, pending a sweep to send. `'pending'` = sent
-   * with a provider ACK, awaiting AEAT's real result. Terminal values
+   * with a provider ACK, awaiting SII's real result. Terminal values
    * (success literal TBD with the provider) land here via the inbound
    * callback, correlated by `externalRef`.
    */
@@ -67,8 +68,8 @@ export class TableRow {
   batchId!: string | null;
 
   /** Last raw callback payload for this row; overwritten wholesale on every callback (no history kept). */
-  @Column({ type: 'jsonb', name: 'aeat_response', nullable: true })
-  aeatResponse!: Record<string, unknown> | null;
+  @Column({ type: 'jsonb', name: 'sii_response', nullable: true })
+  siiResponse!: Record<string, unknown> | null;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt!: Date;

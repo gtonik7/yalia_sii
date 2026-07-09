@@ -1,6 +1,6 @@
 # Runbook: fila atascada en `submission_status = 'pending'`
 
-Parte del pipeline de presentación SII/AEAT (`emitidas` y cualquier otra
+Parte del pipeline de presentación SII (`emitidas` y cualquier otra
 template con `write` configurado). Ver también `src/tables/table-rows.service.ts`
 (`submitGroup`), `src/tables/write-sweep.processor.ts` (modo evento) y
 `src/tables/table-write-batch.service.ts` (modo schedule / red de seguridad).
@@ -8,9 +8,9 @@ template con `write` configurado). Ver también `src/tables/table-rows.service.t
 ## Qué significa "atascada en pending"
 
 Una fila pasa a `submission_status = 'pending'` en cuanto `submitGroup()`
-recibe un ACK 2xx del sistema externo — **no** significa que AEAT ya haya
+recibe un ACK 2xx del sistema externo — **no** significa que SII ya haya
 resuelto la presentación. El resultado real solo llega después, vía el
-callback entrante (`src/callbacks/aeat-result.processor.ts`), correlacionado
+callback entrante (`src/callbacks/sii-result.processor.ts`), correlacionado
 por `external_ref`.
 
 Una fila queda "atascada" cuando lleva en `pending` más tiempo del que
@@ -19,7 +19,7 @@ normales, sin que haya llegado ningún callback. Causas típicas:
 
 1. El callback nunca llegó (el vendor no lo envió, la URL pública no es
    alcanzable, o el HMAC no coincide y el callback fue rechazado con 401 —
-   revisar logs de `AeatCallbackController`).
+   revisar logs de `SiiCallbackController`).
 2. El vendor perdió o descartó la solicitud original.
 3. `external_ref` nunca se pobló para esa fila (ver el punto abierto en el
    plan: hoy `submitGroup()` no extrae ningún `external_ref` del ACK de lote —
@@ -65,14 +65,14 @@ ellas hasta que se resuelva ese punto abierto del diseño.
   (con `MgmtTokenGuard`) para no esperar al próximo evento/cron.
 
 - **Confirmar que el callback llegó pero no correlacionó**: buscar en los
-  logs `AeatResultProcessor` la línea `no row found for external_ref="..."`
+  logs `SiiResultProcessor` la línea `no row found for external_ref="..."`
   — si aparece con el `external_ref` esperado, el problema es que la fila
   nunca tuvo ese `external_ref` asignado (punto 3), no que el callback fallara.
 
-- **Confirmar que el HMAC no está bloqueando todo**: un `AEAT_CALLBACK_HMAC_SECRET`
+- **Confirmar que el HMAC no está bloqueando todo**: un `SII_CALLBACK_HMAC_SECRET`
   mal configurado (o ausente) rechaza el 100% de los callbacks con 401 antes
-  de que lleguen a encolarse — revisar `AeatCallbackController` logs
-  (`AEAT callback rejected: ...`) primero, antes de sospechar de filas
+  de que lleguen a encolarse — revisar `SiiCallbackController` logs
+  (`SII callback rejected: ...`) primero, antes de sospechar de filas
   individuales.
 
 ## Red de seguridad (mitiga, no sustituye, la investigación de arriba)
@@ -80,11 +80,17 @@ ellas hasta que se resuelva ese punto abierto del diseño.
 BullMQ puede no encolar un nuevo job de debounce si el anterior para el mismo
 `(tableKey, groupValues)` ya está `active` (en plena llamada HTTP) cuando
 llega una edición — esa edición se queda `queued` sin ningún sweep futuro que
-la recoja, salvo que algo más la barra. Por eso el hub debe programar
-`table.write.batchSubmit` con una cadencia baja (p. ej. cada 5-10 min) **para
-todas las templates con `write` configurado, incluidas las de modo
-`event`** — `TableWriteBatchService.submitAllQueued()` no distingue por
-`write.trigger`, solo mira qué hay `queued` en la base de datos ahora mismo.
-Esto no sustituye la investigación de una fila atascada en `pending` (ese
-barrido solo recoge lo que sigue en `queued`, nunca reintenta algo que ya
-recibió un ACK), pero evita que una fila se quede en `queued` para siempre.
+la recoja, salvo que algo más la barra.
+
+El cron interno (`WriteCronService`) solo barre las tablas **seleccionadas para
+cron**, es decir las de `write.trigger==='schedule'`; las de modo `event` ya
+**no** las re-barre el cron interno. Por eso, para tablas `event`, el hub (o un
+cron externo) debe programar `POST /v1/operations/table.write.batchSubmit/trigger`
+con una cadencia baja (p. ej. cada 5-10 min) como red de seguridad —
+`TableWriteBatchService.submitAllQueued()` no distingue por `write.trigger`,
+solo mira qué hay `queued` en la base de datos ahora mismo. Cada pasada saca
+como mucho `write.batch.maxRecordsPerPoll` filas por tabla (default 10.000); el
+resto espera a la siguiente. Esto no sustituye la investigación de una fila
+atascada en `pending` (ese barrido solo recoge lo que sigue en `queued`, nunca
+reintenta algo que ya recibió un ACK), pero evita que una fila se quede en
+`queued` para siempre.

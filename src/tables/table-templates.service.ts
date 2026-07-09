@@ -35,18 +35,6 @@ export class TableTemplatesService {
         throw new BadRequestException(`defaultSort.key "${dto.defaultSort.key}" must be a sortable column`);
       }
     }
-    if (dto.audit) {
-      // Pulling without an idField would append duplicates on every re-scan,
-      // defeating the point of an idempotent audit.
-      if (!dto.idField) {
-        throw new BadRequestException('audit tables require an idField so re-scans upsert instead of duplicating');
-      }
-      if (dto.audit.incremental && !keys.has(dto.audit.incremental.updatedAtField)) {
-        throw new BadRequestException(
-          `audit.incremental.updatedAtField "${dto.audit.incremental.updatedAtField}" is not one of the columns`,
-        );
-      }
-    }
     if (dto.write?.path.includes('{id}') && !dto.idField) {
       // Without idField, {id} would resolve against the internal row id,
       // which is almost never a valid identifier for the external system.
@@ -111,9 +99,7 @@ export class TableTemplatesService {
       key: dto.key,
       label: dto.label,
       description: dto.description ?? null,
-      perConnection: dto.perConnection ?? false,
-      // Exposure restriction only makes sense for per-connection tables.
-      connectionIds: dto.perConnection && dto.connectionIds?.length ? dto.connectionIds : null,
+      connectionIds: dto.connectionIds?.length ? dto.connectionIds : null,
       idField: dto.idField ?? '',
       columns: dto.columns.map((c) => ({
         key: c.key,
@@ -123,17 +109,6 @@ export class TableTemplatesService {
         sortable: c.sortable ?? false,
       })),
       defaultSort: dto.defaultSort ?? null,
-      audit: dto.audit
-        ? {
-            connectionId: dto.audit.connectionId,
-            method: dto.audit.method,
-            path: dto.audit.path,
-            query: dto.audit.query,
-            body: dto.audit.body,
-            recordsPath: dto.audit.recordsPath,
-            incremental: dto.audit.incremental,
-          }
-        : null,
       write: dto.write
         ? {
             connectionId: dto.write.connectionId,

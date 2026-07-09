@@ -14,39 +14,6 @@ export interface TableSortDef {
   dir: 'asc' | 'desc';
 }
 
-/** How to advance an incremental audit watermark across poll runs. */
-export interface AuditIncrementalDef {
-  /** Record field holding the modified timestamp (drives the watermark). */
-  updatedAtField: string;
-  /** Request param that carries the watermark on the next run. */
-  sinceParam: string;
-  /** Where the param goes: query string (default) or POST body. */
-  sinceIn?: 'query' | 'body';
-  /** Wire format for the watermark value. Default `iso`. */
-  sinceFormat?: 'iso' | 'epoch_ms' | 'epoch_s';
-}
-
-/**
- * Binds a table to an external source connection so the satellite can *pull*
- * (paginate + upsert) instead of only receiving pushed rows. The endpoint lives
- * here (per table); pagination/auth live on the connection (per API).
- */
-export interface AuditConfig {
-  /** Source connection id (source_connections) this table audits. */
-  connectionId: string;
-  method: 'GET' | 'POST';
-  /** Path appended to the connection baseUrl; may carry its own query string. */
-  path: string;
-  /** Static query params sent on every page request. */
-  query?: Record<string, string>;
-  /** Request body for POST searches. */
-  body?: Record<string, unknown>;
-  /** Overrides the connection's recordsPath when this endpoint differs. */
-  recordsPath?: string;
-  /** When set, only new/changed records are pulled (watermark). */
-  incremental?: AuditIncrementalDef;
-}
-
 /**
  * Partitions queued rows into separate outbound batches by one or more
  * column values (e.g. counterparty NIF + invoice type), instead of always
@@ -57,20 +24,25 @@ export interface BatchConfig {
   groupBy: string[];
   /** Split a partition into smaller sub-batches once it exceeds this size. */
   maxBatchSize?: number;
+  /**
+   * Máximo de filas `queued` sacadas por tabla en cada pasada del cron; el
+   * resto espera a la siguiente pasada. Default 10.000. Aplica al total de la
+   * tabla (todos los grupos), antes de trocear por `maxBatchSize`.
+   */
+  maxRecordsPerPoll?: number;
 }
 
 /**
  * Binds a table to a source connection so an edited row is pushed back to the
  * external system. The endpoint lives here (per table); auth lives on the
- * connection (per API) — mirrors `AuditConfig` but for the outbound direction.
+ * connection (per API).
  */
 export interface WriteConfig {
   /**
    * Default source connection id (source_connections) this table pushes
-   * edits to. On a `perConnection` table, each group of queued rows is
-   * actually submitted through the connection it was *ingested* under (see
-   * `TableRowsService.submitGroup`) — this field is only the fallback used
-   * when that can't be determined (e.g. `perConnection: false`).
+   * edits to. Each group of queued rows is actually submitted through the
+   * connection it was *ingested* under (see `TableRowsService.submitGroup`)
+   * — this field is only the fallback used when that can't be determined.
    */
   connectionId: string;
   method: 'PUT' | 'PATCH' | 'POST';
@@ -120,14 +92,10 @@ export class TableTemplate {
   @Column({ type: 'text', nullable: true })
   description!: string | null;
 
-  /** When true, rows are scoped by connectionId and the explorer asks for one. */
-  @Column({ type: 'boolean', name: 'per_connection', default: false })
-  perConnection!: boolean;
-
   /**
-   * When perConnection is true, restricts which connections expose this table in
-   * the explorer (the connection picker is limited to these ids). Empty/null =
-   * exposed on every connection. Ignored when perConnection is false.
+   * Restricts which connections expose this table in the explorer (the
+   * connection picker is limited to these ids). Empty/null = exposed on
+   * every connection. Every table's rows are always scoped by connectionId.
    */
   @Column({ type: 'jsonb', name: 'connection_ids', nullable: true })
   connectionIds!: string[] | null;
@@ -144,10 +112,6 @@ export class TableTemplate {
 
   @Column({ type: 'jsonb', name: 'default_sort', nullable: true })
   defaultSort!: TableSortDef | null;
-
-  /** Present when the table is fed by pulling/auditing an external source. */
-  @Column({ type: 'jsonb', nullable: true })
-  audit!: AuditConfig | null;
 
   /** Present when edited rows should be pushed back to an external source. */
   @Column({ type: 'jsonb', nullable: true })

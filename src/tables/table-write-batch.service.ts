@@ -4,8 +4,12 @@ import { DataSource } from 'typeorm';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService } from './table-rows.service';
 import type { TableTemplate } from './entities/table-template.entity';
-import { chunkRows, discoverQueuedGroups, fetchQueuedRows, fetchRowsByIds } from './write-sweep-query.util';
+import { chunkRows, fetchQueuedRowsCapped, fetchRowsByIds } from './write-sweep-query.util';
+import type { RowWithConnection } from './write-sweep-query.util';
 import { ParamList } from '../core/sql/sql-params.util';
+
+/** Tope por defecto de filas `queued` sacadas por tabla en cada pasada del cron. */
+const DEFAULT_MAX_RECORDS_PER_POLL = 10_000;
 
 /**
  * Schedule-mode counterpart to WriteSweepProcessor: instead of one debounced
@@ -38,34 +42,31 @@ export class TableWriteBatchService {
   /**
    * Validate synchronously (so a bad tableKey/missing write config surfaces
    * as an immediate 4xx to the hub caller), then run the actual sweep in the
-   * background — mirrors SourcePollService.poll()'s split, for the same
-   * reason: submitting several batches sequentially to a possibly-slow
+   * background: submitting several batches sequentially to a possibly-slow
    * external system is not something the triggering HTTP request should
    * block on.
    *
    * `connectionId` — forwarded verbatim by the hub from the Flow origin that
-   * scheduled this tick — scopes the sweep to one connection's queued rows on
-   * a perConnection table, so the same table (e.g. shared across several AEAT
-   * company connections) can have an independent cron cadence per connection.
-   * Ignored for non-perConnection templates, which always sweep every row.
+   * scheduled this tick — scopes the sweep to one connection's queued rows, so
+   * the same table (e.g. shared across several SII company connections) can
+   * have an independent cron cadence per connection.
    */
   async trigger(tableKey: string, trigger: 'schedule' | 'manual' = 'schedule', connectionId?: string): Promise<{ queued: number }> {
     const template = await this.templates.getByKey(tableKey);
     if (!template.write) {
       throw new BadRequestException(`Table "${tableKey}" has no write config to submit rows through`);
     }
-    const scopedConnectionId = template.perConnection ? connectionId : undefined;
     // Synchronous pre-count so the (fire-and-forget) caller gets an immediate,
     // accurate "how much am I submitting" number for its UI/toast, without
     // waiting on the actual outbound batches.
     const p = new ParamList();
     const where = [`table_key = ${p.push(tableKey)}`, `submission_status = 'queued'`];
-    if (scopedConnectionId) where.push(`connection_id = ${p.push(scopedConnectionId)}`);
+    if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
     const [{ count }]: { count: string }[] = await this.dataSource.query(
       `SELECT count(*)::text AS count FROM table_rows WHERE ${where.join(' AND ')}`,
       p.all,
     );
-    void this.submitAllQueued(template, trigger, scopedConnectionId).catch((err) => {
+    void this.submitAllQueued(template, trigger, connectionId).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`Batch submit table=${tableKey} failed: ${message}`);
     });
@@ -75,30 +76,18 @@ export class TableWriteBatchService {
   /**
    * The actual full sweep for an already-validated template — public so tests
    * can await it directly instead of racing the fire-and-forget in
-   * `trigger()`. When the template is perConnection, each discovered group is
-   * submitted through the connection its rows were ingested under (optionally
-   * narrowed to one `connectionId`), never through a single fixed connection.
+   * `trigger()`. Each discovered group is submitted through the connection
+   * its rows were ingested under (optionally narrowed to one `connectionId`),
+   * never through a single fixed connection.
    */
   async submitAllQueued(template: TableTemplate, trigger: 'schedule' | 'manual' = 'schedule', connectionId?: string): Promise<void> {
-    const groupBy = template.write?.batch?.groupBy ?? [];
-    const maxBatchSize = template.write?.batch?.maxBatchSize;
-    const groups = await discoverQueuedGroups(this.dataSource, template.key, groupBy, {
-      perConnection: template.perConnection,
-      connectionId,
-    });
-
-    for (const group of groups) {
-      const queued = await fetchQueuedRows(this.dataSource, template.key, group.groupValues, group.connectionId);
-      if (!queued.length) continue;
-
-      const chunks = maxBatchSize ? chunkRows(queued, maxBatchSize) : [queued];
-      for (const rowsChunk of chunks) {
-        const result = await this.rows.submitGroup(template, rowsChunk, { trigger, groupValues: group.groupValues, connectionId: group.connectionId });
-        if (result?.status === 'error') {
-          this.logger.warn(`Batch submit table=${template.key} batch=${result.batchId} failed: ${result.error}`);
-        }
-      }
-    }
+    // Tope por tabla y pasada: solo se sacan hasta `maxRecordsPerPoll` filas
+    // `queued` (las más antiguas primero); el resto espera a la siguiente
+    // pasada. El troceo por grupo/`maxBatchSize` se aplica *dentro* de ese tope.
+    const limit = template.write?.batch?.maxRecordsPerPoll ?? DEFAULT_MAX_RECORDS_PER_POLL;
+    const queued = await fetchQueuedRowsCapped(this.dataSource, template.key, limit, connectionId);
+    if (!queued.length) return;
+    await this.partitionAndSubmit(template, queued, trigger);
   }
 
   /**
@@ -107,8 +96,8 @@ export class TableWriteBatchService {
    * `submission_status IN ('queued','error')` — are sent; the rest of the
    * selection is counted as `skipped` so nothing already accepted/pending is
    * re-presented to the external system. Eligible rows are partitioned exactly
-   * like the queued sweeps (by ingestion connection on perConnection tables and
-   * by `write.batch.groupBy`), so each partition ships through its own
+   * like the queued sweeps (by ingestion connection and by
+   * `write.batch.groupBy`), so each partition ships through its own
    * connection and honours `maxBatchSize`.
    */
   async submitByIds(
@@ -120,19 +109,35 @@ export class TableWriteBatchService {
     if (!template.write) {
       throw new BadRequestException(`Table "${tableKey}" has no write config to submit rows through`);
     }
-    const scopedConnectionId = template.perConnection ? connectionId : undefined;
-    const eligible = await fetchRowsByIds(this.dataSource, tableKey, ids, scopedConnectionId);
+    const eligible = await fetchRowsByIds(this.dataSource, tableKey, ids, connectionId);
     const skipped = ids.length - eligible.length;
     if (!eligible.length) return { submitted: 0, skipped };
 
-    const groupBy = template.write.batch?.groupBy ?? [];
-    const maxBatchSize = template.write.batch?.maxBatchSize;
+    await this.partitionAndSubmit(template, eligible, 'manual');
+    return { submitted: eligible.length, skipped };
+  }
 
-    // Partition in memory by (connection, groupBy values) — same shape as
-    // discoverQueuedGroups, but over the explicit selection instead of a query.
-    const partitions = new Map<string, { connectionId: string | null; groupValues: Record<string, string>; rows: { id: string; data: Record<string, unknown> }[] }>();
-    for (const row of eligible) {
-      const connId = template.perConnection ? row.connectionId : null;
+  /**
+   * Particiona un conjunto de filas por (conexión de ingesta, `write.batch.groupBy`)
+   * y submite cada partición como uno o más batches (troceados por `maxBatchSize`),
+   * cada uno a través de la conexión bajo la que se ingestó. Núcleo compartido por
+   * el barrido programado (`submitAllQueued`) y el force-submit (`submitByIds`), de
+   * modo que ambos particionan/trocean de forma idéntica.
+   */
+  private async partitionAndSubmit(
+    template: TableTemplate,
+    rows: RowWithConnection[],
+    trigger: 'schedule' | 'manual',
+  ): Promise<void> {
+    const groupBy = template.write?.batch?.groupBy ?? [];
+    const maxBatchSize = template.write?.batch?.maxBatchSize;
+
+    const partitions = new Map<
+      string,
+      { connectionId: string | null; groupValues: Record<string, string>; rows: { id: string; data: Record<string, unknown> }[] }
+    >();
+    for (const row of rows) {
+      const connId = row.connectionId;
       const groupValues: Record<string, string> = {};
       for (const col of groupBy) groupValues[col] = String(row.data[col] ?? '');
       const key = `${connId ?? ''}::${JSON.stringify(groupValues)}`;
@@ -145,16 +150,14 @@ export class TableWriteBatchService {
       const chunks = maxBatchSize ? chunkRows(part.rows, maxBatchSize) : [part.rows];
       for (const rowsChunk of chunks) {
         const result = await this.rows.submitGroup(template, rowsChunk, {
-          trigger: 'manual',
+          trigger,
           groupValues: groupBy.length ? part.groupValues : null,
           connectionId: part.connectionId,
         });
         if (result?.status === 'error') {
-          this.logger.warn(`Force submit table=${tableKey} batch=${result.batchId} failed: ${result.error}`);
+          this.logger.warn(`Submit table=${template.key} batch=${result.batchId} failed: ${result.error}`);
         }
       }
     }
-
-    return { submitted: eligible.length, skipped };
   }
 }

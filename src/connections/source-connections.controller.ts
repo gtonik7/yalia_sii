@@ -39,13 +39,25 @@ export class SourceConnectionsController {
     return this.service.remove(id);
   }
 
+  /** The URL + plaintext secret for this connection's SII-result callback, to hand to the external system. */
+  @Get(':id/sii-callback')
+  getSiiCallback(@Param('id') id: string) {
+    return this.service.getCallbackInfo(id);
+  }
+
+  /** Rotate the callback secret — the old one stops verifying immediately. */
+  @Post(':id/sii-callback/rotate')
+  rotateSiiCallback(@Param('id') id: string) {
+    return this.service.rotateCallbackSecret(id);
+  }
+
   /**
    * Real connection test: fire the connection's configured `handshake`
    * (method + path/query/body) through its auth and report the HTTP status. The
    * request body may override the stored handshake for ad-hoc checks; with no
    * handshake and no override it falls back to a bare `GET` on the base URL.
-   * This is a reachability/auth check — the table data fetch is configured on
-   * each table's `audit`, not here.
+   * This is a reachability/auth check — the outbound write request is
+   * configured on each table's `write`, not here.
    */
   @Post(':id/test')
   async test(
