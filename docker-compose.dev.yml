@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: yalia_sii_postgres
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: yalia
+      POSTGRES_PASSWORD: yalia
+      POSTGRES_DB: yalia_sii
+    volumes:
+      - yalia_sii_pg:/var/lib/postgresql/data
+
+  # Redis standalone para desarrollo aislado del satélite.
+  # En producción usar el docker-compose.yml raíz (Redis compartido con el hub).
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: yalia_datatable_redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - '6382:6379'
+  #   command: ['redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec']
+  #   volumes:
+  #     - redis_data:/data
+
+volumes:
+  yalia_sii_pg:
+  redis_data:
