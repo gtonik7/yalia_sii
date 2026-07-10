@@ -49,16 +49,6 @@ export class CapabilitiesController {
           kind: 'table-templates',
           requiresConnection: false,
         },
-        {
-          // Visor de registros en contexto del satélite: ver/editar filas de
-          // cada tabla, su estado de presentación SII (`submission_status`) y
-          // forzar el envío de las que están en cola. Alternativa in-place al
-          // Explorador global; consume el mismo contrato `/v1/datasets`.
-          key: 'records',
-          label: 'Registros',
-          kind: 'table-records',
-          requiresConnection: false,
-        },
       ],
       // `table.ingest` (push) needs no trigger.
       triggerableOperations: [
