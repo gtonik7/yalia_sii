@@ -16,6 +16,29 @@ import { Type } from 'class-transformer';
 
 const COLUMN_TYPES = ['string', 'number', 'date', 'boolean', 'json'] as const;
 
+export class NumberFormatDto {
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  decimals?: number;
+
+  @IsOptional()
+  @IsString()
+  separator?: string;
+
+  @IsOptional()
+  @IsString()
+  decimalSeparator?: string;
+
+  @IsOptional()
+  @IsString()
+  prefix?: string;
+
+  @IsOptional()
+  @IsString()
+  suffix?: string;
+}
+
 export class TableColumnDto {
   @IsString()
   @Matches(/^[A-Za-z0-9_.-]+$/, { message: 'column key: letters, digits, _ . -' })
@@ -35,6 +58,19 @@ export class TableColumnDto {
   @IsOptional()
   @IsBoolean()
   sortable?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  hidden?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  excludeFromPayload?: boolean;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NumberFormatDto)
+  numberFormat?: NumberFormatDto;
 }
 
 export class TableSortDto {
@@ -62,7 +98,7 @@ export class BatchConfigDto {
   maxRecordsPerPoll?: number;
 }
 
-export class WriteConfigDto {
+export class WriteConnectionRuleDto {
   @IsString()
   @MinLength(1)
   connectionId!: string;
@@ -77,13 +113,17 @@ export class WriteConfigDto {
   @IsOptional()
   @IsObject()
   query?: Record<string, string>;
+}
 
-  @IsOptional()
-  @IsString()
-  externalRefPath?: string;
-
+export class WriteConfigDto {
   @IsIn(['event', 'schedule'])
   trigger!: 'event' | 'schedule';
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ValidateNested({ each: true })
+  @Type(() => WriteConnectionRuleDto)
+  connections!: WriteConnectionRuleDto[];
 
   @IsOptional()
   @ValidateNested()
@@ -129,4 +169,10 @@ export class UpsertTableTemplateDto {
   @ValidateNested()
   @Type(() => WriteConfigDto)
   write?: WriteConfigDto;
+
+  /** Opt-in automatic purge (days); unset = keep rows indefinitely. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  retentionDays?: number;
 }

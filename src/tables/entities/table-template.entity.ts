@@ -1,12 +1,31 @@
 import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
 import { DatasetColumnType } from '../../datasets/dataset.types';
 
+export interface NumberFormat {
+  /** Number of decimal places to display (e.g., 2 for currency). */
+  decimals?: number;
+  /** Thousands separator; omit to suppress thousands grouping. */
+  separator?: string;
+  /** Decimal separator; defaults to '.' when omitted. */
+  decimalSeparator?: string;
+  /** Prefix to prepend (e.g., '€', '$'). */
+  prefix?: string;
+  /** Suffix to append (e.g., '%', ' units'). */
+  suffix?: string;
+}
+
 export interface TableColumnDef {
   key: string;
   label: string;
   type: DatasetColumnType;
   filterable?: boolean;
   sortable?: boolean;
+  /** When true, hidden from the records grid by default (still stored/queryable). */
+  hidden?: boolean;
+  /** When true, this field is omitted from the outbound payload sent on write-back — informational only. */
+  excludeFromPayload?: boolean;
+  /** Number formatting rules for type='number' columns (display only, doesn't alter stored value). */
+  numberFormat?: NumberFormat;
 }
 
 export interface TableSortDef {
@@ -33,17 +52,12 @@ export interface BatchConfig {
 }
 
 /**
- * Binds a table to a source connection so an edited row is pushed back to the
- * external system. The endpoint lives here (per table); auth lives on the
- * connection (per API).
+ * Binds one source connection to the endpoint its rows are pushed back to.
+ * Method/path/query are per-connection (not a shared base) because the same
+ * table can be exposed on connections whose external systems expect
+ * different endpoints.
  */
-export interface WriteConfig {
-  /**
-   * Default source connection id (source_connections) this table pushes
-   * edits to. Each group of queued rows is actually submitted through the
-   * connection it was *ingested* under (see `TableRowsService.submitGroup`)
-   * — this field is only the fallback used when that can't be determined.
-   */
+export interface WriteConnectionRule {
   connectionId: string;
   method: 'PUT' | 'PATCH' | 'POST';
   /**
@@ -52,10 +66,18 @@ export interface WriteConfig {
    * unset or the value is missing).
    */
   path: string;
-  /** Static query params merged into every write request. */
+  /** Static query params merged into every write request for this connection. */
   query?: Record<string, string>;
-  /** Dot-path in the response body to pluck an external reference (optional). */
-  externalRefPath?: string;
+}
+
+/**
+ * Binds a table to source connections so an edited row is pushed back to the
+ * external system. A row ingested under a connection with no matching rule
+ * in `connections` is rejected before it's saved
+ * (`TableRowsService.updateAndWrite`) or sent (`TableRowsService.submitGroup`)
+ * — there is no implicit fallback connection or endpoint.
+ */
+export interface WriteConfig {
   /**
    * What enqueues a submission sweep: `'event'` debounces a sweep right after
    * each insert/edit; `'schedule'` relies solely on the hub calling
@@ -67,6 +89,8 @@ export interface WriteConfig {
    * (`WriteConfigDto`) requires it on every create/update.
    */
   trigger?: 'event' | 'schedule';
+  /** One rule per allowed connection — configured one by one, no shared base. */
+  connections: WriteConnectionRule[];
   /** Present when queued rows must be partitioned before submitting. */
   batch?: BatchConfig;
 }
@@ -116,6 +140,15 @@ export class TableTemplate {
   /** Present when edited rows should be pushed back to an external source. */
   @Column({ type: 'jsonb', nullable: true })
   write!: WriteConfig | null;
+
+  /**
+   * Opt-in automatic purge: rows older than this many days are deleted by
+   * `TableRetentionCron` (daily sweep, reuses `TableRowsService.deleteRows`).
+   * Null/unset = no automatic retention (default — fiscal tables must opt in
+   * explicitly; there is no implicit expiry of SII data).
+   */
+  @Column({ type: 'int', name: 'retention_days', nullable: true })
+  retentionDays!: number | null;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt!: Date;

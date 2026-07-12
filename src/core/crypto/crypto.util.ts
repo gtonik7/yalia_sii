@@ -7,7 +7,13 @@ const TAG_LEN = 16;
 function getKey(): Buffer {
   const hex = process.env.CREDENTIALS_ENC_KEY;
   if (!hex) throw new Error('CREDENTIALS_ENC_KEY not set');
-  return Buffer.from(hex, 'hex');
+  const key = Buffer.from(hex, 'hex');
+  // AES-256-GCM needs a 32-byte key; a wrong length silently weakens
+  // encryption (or throws deep in the cipher) — fail fast instead.
+  if (key.length !== 32) {
+    throw new Error(`CREDENTIALS_ENC_KEY must be 32 bytes hex (64 hex chars); got ${key.length} bytes`);
+  }
+  return key;
 }
 
 export function encryptJson(payload: unknown): string {

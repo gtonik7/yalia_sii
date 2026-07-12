@@ -12,6 +12,15 @@ import { ParamList } from '../core/sql/sql-params.util';
 const DEFAULT_MAX_RECORDS_PER_POLL = 10_000;
 
 /**
+ * Tope duro de filas por llamada HTTP saliente, independiente de
+ * `write.batch.maxBatchSize` (que solo agrupa; el usuario podría no
+ * configurarlo, o configurarlo por encima de esto). Sin este tope, un sweep de
+ * hasta `DEFAULT_MAX_RECORDS_PER_POLL` filas en una partición sin `maxBatchSize`
+ * iría entero en una sola petición al sistema externo.
+ */
+const HARD_MAX_BATCH_SIZE = 1000;
+
+/**
  * Schedule-mode counterpart to WriteSweepProcessor: instead of one debounced
  * job for one already-known batch group (event mode), this is invoked
  * directly by the hub's cron and must sweep *every* group of a template in
@@ -119,10 +128,13 @@ export class TableWriteBatchService {
 
   /**
    * Particiona un conjunto de filas por (conexión de ingesta, `write.batch.groupBy`)
-   * y submite cada partición como uno o más batches (troceados por `maxBatchSize`),
-   * cada uno a través de la conexión bajo la que se ingestó. Núcleo compartido por
-   * el barrido programado (`submitAllQueued`) y el force-submit (`submitByIds`), de
-   * modo que ambos particionan/trocean de forma idéntica.
+   * y submite cada partición como uno o más batches, troceados por
+   * `write.batch.maxBatchSize` — nunca por encima de `HARD_MAX_BATCH_SIZE` (1000),
+   * así que aunque no se configure `maxBatchSize` (o se configure más alto), ninguna
+   * llamada saliente lleva más de 1000 filas. Núcleo compartido por el barrido
+   * programado (`submitAllQueued`, hasta 10.000 filas `queued` por pasada) y el
+   * force-submit (`submitByIds`, selección por checkbox — ya acotada a 1000 por el FE
+   * al limitarse a la página actual), de modo que ambos particionan/trocean igual.
    */
   private async partitionAndSubmit(
     template: TableTemplate,
@@ -130,7 +142,7 @@ export class TableWriteBatchService {
     trigger: 'schedule' | 'manual',
   ): Promise<void> {
     const groupBy = template.write?.batch?.groupBy ?? [];
-    const maxBatchSize = template.write?.batch?.maxBatchSize;
+    const maxBatchSize = Math.min(template.write?.batch?.maxBatchSize ?? HARD_MAX_BATCH_SIZE, HARD_MAX_BATCH_SIZE);
 
     const partitions = new Map<
       string,
@@ -147,7 +159,7 @@ export class TableWriteBatchService {
     }
 
     for (const part of partitions.values()) {
-      const chunks = maxBatchSize ? chunkRows(part.rows, maxBatchSize) : [part.rows];
+      const chunks = chunkRows(part.rows, maxBatchSize);
       for (const rowsChunk of chunks) {
         const result = await this.rows.submitGroup(template, rowsChunk, {
           trigger,

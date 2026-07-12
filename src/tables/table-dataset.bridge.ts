@@ -64,6 +64,28 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
           : [{ key: c.key, label: c.label, type: c.type }],
       );
 
+    // Write-back status/timestamp columns are reserved (physical table_rows
+    // columns, not part of the user-declared template.columns) — only worth
+    // exposing as filters when the table actually has write-back configured.
+    if (t.write) {
+      filters.push(
+        {
+          key: '_writeStatus',
+          label: 'Estado envío',
+          type: 'string',
+          column: '_writeStatus',
+          options: [
+            { value: 'queued', label: 'En cola' },
+            { value: 'sent', label: 'Enviado' },
+            { value: 'error', label: 'Error' },
+          ],
+        },
+        { key: '_submissionStatus', label: 'Estado SII', type: 'string', column: '_submissionStatus' },
+        { key: '_updatedAt_from', label: 'Actualizado (desde)', type: 'date', column: '_updatedAt' },
+        { key: '_updatedAt_until', label: 'Actualizado (hasta)', type: 'date', column: '_updatedAt' },
+      );
+    }
+
     return {
       key: t.key,
       label: t.label,
@@ -77,10 +99,13 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
         type: c.type,
         filterable: c.filterable,
         sortable: c.sortable,
+        hidden: c.hidden,
+        numberFormat: c.numberFormat,
       })),
       filters: filters.length ? filters : undefined,
       defaultSort: t.defaultSort ?? undefined,
       editable: t.write ? true : undefined,
+      writableConnectionIds: t.write?.connections.map((r) => r.connectionId),
       deletable: true,
       // Las tablas de usuario se operan desde la pestaña "Registros" del
       // satélite, no desde el Explorer global (donde sí quedan los datasets de

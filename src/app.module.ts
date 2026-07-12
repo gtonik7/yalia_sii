@@ -5,6 +5,7 @@ import { TypeOrmModule, TypeOrmModuleOptions } from '@nestjs/typeorm';
 import { BullModule } from '@nestjs/bullmq';
 import { AppConfigModule } from './config/config.module';
 import { RedisModule } from './core/redis/redis.module';
+import { ProvisionedTokenModule } from './core/auth/provisioned-token.module';
 import { OperationRegistryModule } from './operations/operation-registry.module';
 import { JobsModule } from './jobs/jobs.module';
 import { HealthModule } from './health/health.module';
@@ -31,15 +32,14 @@ import type { Env } from './config/env';
           password: cfg.get('DB_PASSWORD', { infer: true }),
           database: cfg.get('DB_NAME', { infer: true }),
           autoLoadEntities: true,
-          // Siempre por migraciones, también en dev — a diferencia de yalia_hub
-          // (donde `synchronize` en dev nunca carga el DDL específico de
-          // Timescale), aquí `search_vector` (columna generada, creada por SQL
-          // crudo en la migración) es parte del esquema desde el arranque, y
-          // `synchronize` no sabe reconciliar una columna generada que no
-          // declara ningún entity: su introspección de esquema consulta la
-          // tabla `typeorm_metadata` (que TypeORM solo autocrea cuando ES ÉL
-          // quien posee metadata de columnas generadas/vistas) y revienta con
-          // "relation typeorm_metadata does not exist". Correr
+          // Siempre por migraciones, también en dev. El esquema tiene DDL que
+          // `synchronize` no sabe reconciliar y que ningún entity declara: el
+          // trigger `updated_at` (BEFORE UPDATE), la hypertable de Timescale de
+          // `source_poll_runs`, y los índices únicos parciales dinámicos por
+          // template (`TableIndexManagerService`). (La columna generada
+          // `search_vector` existió y forzaba esto vía `typeorm_metadata`; se
+          // retiró por compresión —ver DropTableRowsSearchVector— pero la
+          // política migrations-only se mantiene por el resto de DDL.) Correr
           // `npm run migration:run` es, por tanto, un prerrequisito real antes
           // de `start:dev`, no solo un paso de despliegue.
           synchronize: false,
@@ -65,6 +65,7 @@ import type { Env } from './config/env';
     }),
 
     RedisModule,
+    ProvisionedTokenModule,
     OperationRegistryModule,
     JobsModule,
     HealthModule,

@@ -35,12 +35,21 @@ export class TableTemplatesService {
         throw new BadRequestException(`defaultSort.key "${dto.defaultSort.key}" must be a sortable column`);
       }
     }
-    if (dto.write?.path.includes('{id}') && !dto.idField) {
-      // Without idField, {id} would resolve against the internal row id,
-      // which is almost never a valid identifier for the external system.
-      throw new BadRequestException(
-        'write.path uses {id} but the table has no idField — it would resolve against the internal row id, not a valid external identifier',
-      );
+    if (dto.write) {
+      const seenConnections = new Set<string>();
+      for (const rule of dto.write.connections) {
+        if (seenConnections.has(rule.connectionId)) {
+          throw new BadRequestException(`write.connections has a duplicate rule for connection "${rule.connectionId}"`);
+        }
+        seenConnections.add(rule.connectionId);
+        if (rule.path.includes('{id}') && !dto.idField) {
+          // Without idField, {id} would resolve against the internal row id,
+          // which is almost never a valid identifier for the external system.
+          throw new BadRequestException(
+            `write.connections["${rule.connectionId}"].path uses {id} but the table has no idField — it would resolve against the internal row id, not a valid external identifier`,
+          );
+        }
+      }
     }
     if (dto.write?.batch) {
       for (const groupKey of dto.write.batch.groupBy) {
@@ -107,19 +116,19 @@ export class TableTemplatesService {
         type: c.type,
         filterable: c.filterable ?? false,
         sortable: c.sortable ?? false,
+        hidden: c.hidden ?? false,
+        excludeFromPayload: c.excludeFromPayload ?? false,
+        numberFormat: c.numberFormat,
       })),
       defaultSort: dto.defaultSort ?? null,
       write: dto.write
         ? {
-            connectionId: dto.write.connectionId,
-            method: dto.write.method,
-            path: dto.write.path,
-            query: dto.write.query,
-            externalRefPath: dto.write.externalRefPath,
             trigger: dto.write.trigger,
+            connections: dto.write.connections,
             batch: dto.write.batch,
           }
         : null,
+      retentionDays: dto.retentionDays ?? null,
     };
   }
 }

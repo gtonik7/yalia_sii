@@ -20,11 +20,11 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     perConnection: false,
     deletable: true,
     columns: [
-      { key: 'createdAt', label: 'Inicio', type: 'date', sortable: true },
-      { key: 'completedAt', label: 'Fin', type: 'date' },
+      { key: 'createdAt', label: 'Inicio', type: 'date', sortable: true, filterable: true },
+      { key: 'completedAt', label: 'Fin', type: 'date', filterable: true },
       { key: 'status', label: 'Estado', type: 'string', filterable: true },
       { key: 'tableKey', label: 'Tabla', type: 'string', filterable: true },
-      { key: 'connectionName', label: 'Conexión', type: 'string' },
+      { key: 'connectionName', label: 'Conexión', type: 'string', filterable: true },
       { key: 'trigger', label: 'Disparador', type: 'string', filterable: true },
       { key: 'rowCount', label: 'Filas', type: 'number' },
       { key: 'httpStatus', label: 'HTTP', type: 'number' },
@@ -40,6 +40,8 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
           { value: 'error', label: 'error' },
         ],
       },
+      { key: 'tableKey', label: 'Tabla', type: 'string' },
+      { key: 'connectionName', label: 'Conexión', type: 'string' },
       {
         key: 'trigger',
         label: 'Disparador',
@@ -50,6 +52,10 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
           { value: 'manual', label: 'manual' },
         ],
       },
+      { key: 'createdAt_from', label: 'Inicio (desde)', type: 'date', column: 'createdAt' },
+      { key: 'createdAt_until', label: 'Inicio (hasta)', type: 'date', column: 'createdAt' },
+      { key: 'completedAt_from', label: 'Fin (desde)', type: 'date', column: 'completedAt' },
+      { key: 'completedAt_until', label: 'Fin (hasta)', type: 'date', column: 'completedAt' },
     ],
     defaultSort: { key: 'createdAt', dir: 'desc' },
   };
@@ -68,6 +74,11 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     if (params.filters?.tableKey) qb.andWhere('r.tableKey = :tableKey', { tableKey: params.filters.tableKey });
     if (params.filters?.status) qb.andWhere('r.status = :status', { status: params.filters.status });
     if (params.filters?.trigger) qb.andWhere('r.trigger = :trigger', { trigger: params.filters.trigger });
+    if (params.filters?.connectionName) qb.andWhere('r.connectionName ILIKE :connectionName', { connectionName: `%${params.filters.connectionName}%` });
+    if (params.filters?.createdAt_from) qb.andWhere('r.createdAt >= :createdAtFrom', { createdAtFrom: params.filters.createdAt_from });
+    if (params.filters?.createdAt_until) qb.andWhere('r.createdAt <= :createdAtUntil', { createdAtUntil: params.filters.createdAt_until });
+    if (params.filters?.completedAt_from) qb.andWhere('r.completedAt >= :completedAtFrom', { completedAtFrom: params.filters.completedAt_from });
+    if (params.filters?.completedAt_until) qb.andWhere('r.completedAt <= :completedAtUntil', { completedAtUntil: params.filters.completedAt_until });
 
     const [rows, total] = await qb
       .orderBy('r.createdAt', 'DESC')

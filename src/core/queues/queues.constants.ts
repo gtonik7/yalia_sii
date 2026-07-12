@@ -16,9 +16,15 @@ export function satelliteWriteEventQueueName(key: string = satelliteKey()): stri
   return `sat-${key}-write-event`;
 }
 
+/** Control channel (hub → satélite): provisión/rotación del token de gestión. */
+export function satelliteControlQueueName(key: string = satelliteKey()): string {
+  return `sat-${key}-control`;
+}
+
 export const QUEUES = {
   JOBS: satelliteJobsQueueName(),
   WRITE_EVENT: satelliteWriteEventQueueName(),
+  CONTROL: satelliteControlQueueName(),
   // Inbound SII-result callback: fixed name (not per-satellite-key) since this
   // satellite's identity is permanently "sii" — mirrors the HUB_* queues below.
   SII_INBOUND: 'sii-inbound-results',

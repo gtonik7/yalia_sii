@@ -47,7 +47,13 @@ export class TableRow {
   @Column({ type: 'timestamptz', name: 'last_written_at', nullable: true })
   lastWrittenAt!: Date | null;
 
-  /** Reference plucked from the external system's response (via externalRefPath), if any. Also the callback's correlation key. */
+  /**
+   * Legacy field from a superseded correlation design (plucking a vendor-issued
+   * ref from the write-back response). Never populated by current code — the
+   * inbound callback correlates by `id` (`internal_ref`) instead, see
+   * `SiiResultProcessor`. Kept only because dropping the column/index is a
+   * separate migration.
+   */
   @Column({ type: 'text', name: 'external_ref', nullable: true })
   externalRef!: string | null;
 
@@ -58,7 +64,7 @@ export class TableRow {
    * `'queued'` = edited/ingested, pending a sweep to send. `'pending'` = sent
    * with a provider ACK, awaiting SII's real result. Terminal values
    * (success literal TBD with the provider) land here via the inbound
-   * callback, correlated by `externalRef`.
+   * callback, correlated by the row's own `id` (`internal_ref`).
    */
   @Column({ type: 'varchar', length: 16, name: 'submission_status', nullable: true })
   submissionStatus!: string | null;

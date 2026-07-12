@@ -1,5 +1,18 @@
 export type DatasetColumnType = 'string' | 'number' | 'date' | 'boolean' | 'json';
 
+export interface NumberFormat {
+  /** Number of decimal places to display (e.g., 2 for currency). */
+  decimals?: number;
+  /** Thousands separator; omit to suppress thousands grouping. */
+  separator?: string;
+  /** Decimal separator; defaults to '.' when omitted. */
+  decimalSeparator?: string;
+  /** Prefix to prepend (e.g., '€', '$'). */
+  prefix?: string;
+  /** Suffix to append (e.g., '%', ' units'). */
+  suffix?: string;
+}
+
 export interface DatasetColumn {
   /** Key in each row object. */
   key: string;
@@ -10,6 +23,10 @@ export interface DatasetColumn {
   filterable?: boolean;
   /** When true, the FE header is clickable to sort by this column (server-side). */
   sortable?: boolean;
+  /** When true, hidden from the records grid by default (still stored/queryable). */
+  hidden?: boolean;
+  /** Number formatting rules for type='number' columns (display only, doesn't alter stored value). */
+  numberFormat?: NumberFormat;
 }
 
 export interface DatasetFilterDef {
@@ -56,6 +73,12 @@ export interface DatasetDescriptor {
   deletable?: boolean;
   /** When true, the provider exposes update() and the FE shows an edit form. */
   editable?: boolean;
+  /**
+   * When editable, the subset of connectionIds allowed to write back for this
+   * dataset. Rows under any other connection are read-only. Omitted/absent =
+   * editing isn't connection-restricted (existing hand-written providers).
+   */
+  writableConnectionIds?: string[];
   /**
    * When true, the FE hides this dataset from the global Explorer (it stays
    * reachable through its own dedicated tab — e.g. las tablas de usuario, que
