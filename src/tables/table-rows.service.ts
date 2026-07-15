@@ -180,7 +180,16 @@ export class TableRowsService {
                     if (!prev || recencyOf(data) >= recencyOf(prev)) withId.set(key, data);
                 }
 
-                for (const chunk of chunk1000([...withId.values()])) {
+                // Sorted by conflict key (not arrival order) so two concurrent ingest()
+                // transactions whose row sets overlap always take table_rows' row locks
+                // in the same order — arrival order comes straight from the source
+                // payload (SFTP/webhook), which two concurrent batches for the same
+                // connection have no reason to agree on. Without this, transaction A
+                // could lock id X then wait on Y while transaction B locks Y then waits
+                // on X, and Postgres kills one with "deadlock detected".
+                const sortedWithId = [...withId.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, data]) => data);
+
+                for (const chunk of chunk1000(sortedWithId)) {
                     const values: string[] = [];
                     const params: unknown[] = [];
                     chunk.forEach((data, idx) => {
