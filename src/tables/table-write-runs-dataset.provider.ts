@@ -1,8 +1,8 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
 import { DatasetRegistryService } from '../datasets/dataset-registry.service';
-import type { DatasetDeleteParams, DatasetDescriptor, DatasetPage, DatasetProvider, DatasetQuery } from '../datasets/dataset.types';
+import type { DatasetDeleteParams, DatasetDescriptor, DatasetDetailParams, DatasetPage, DatasetProvider, DatasetQuery } from '../datasets/dataset.types';
 import { TableWriteRun } from './entities/table-write-run.entity';
 
 /**
@@ -19,6 +19,9 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     description: 'Historial de lotes salientes de presentación al sistema externo',
     perConnection: false,
     deletable: true,
+    // La lista no trae payload_preview/response_body (jsonb ~70-100KB/fila); el
+    // FE los carga al abrir el detalle vía getDetail().
+    hasDetail: true,
     columns: [
       { key: 'createdAt', label: 'Inicio', type: 'date', sortable: true, filterable: true },
       { key: 'completedAt', label: 'Fin', type: 'date', filterable: true },
@@ -80,11 +83,21 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     if (params.filters?.completedAt_from) qb.andWhere('r.completedAt >= :completedAtFrom', { completedAtFrom: params.filters.completedAt_from });
     if (params.filters?.completedAt_until) qb.andWhere('r.completedAt <= :completedAtUntil', { completedAtUntil: params.filters.completedAt_until });
 
-    const [rows, total] = await qb
-      .orderBy('r.createdAt', 'DESC')
-      .skip((params.page - 1) * params.pageSize)
-      .take(params.pageSize)
-      .getManyAndCount();
+    const [rows, total] = await Promise.all([
+      qb
+        .clone()
+        // Solo la PK + las columnas de la grilla. Se excluyen adrede
+        // payload_preview y response_body (jsonb ~70-100KB/fila): traerlos aquí
+        // hacía que una página de 1000 filas pesara decenas de MB y expirara el
+        // timeout del proxy del hub. El detalle completo se carga bajo demanda
+        // en getDetail() al abrir la fila.
+        .select(['r.id', ...this.descriptor.columns.map((c) => `r.${c.key}`)])
+        .orderBy('r.createdAt', 'DESC')
+        .skip((params.page - 1) * params.pageSize)
+        .take(params.pageSize)
+        .getMany(),
+      this.countTotal(qb, params.filters),
+    ]);
 
     return {
       // La ficha genérica del explorer (checkbox/selección/borrado) se
@@ -94,6 +107,40 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
       page: params.page,
       pageSize: params.pageSize,
     };
+  }
+
+  /**
+   * Fila completa (incluye payload_preview/response_body) para el detalle que
+   * el FE abre al hacer clic. Es una única fila por PK, así que el peso del
+   * jsonb no es problema aquí (a diferencia de traerlo por página en la lista).
+   */
+  async getDetail(params: DatasetDetailParams): Promise<Record<string, unknown> | null> {
+    const row = await this.repo.findOne({ where: { id: params.id } });
+    if (!row) return null;
+    return { ...row, _id: row.id } as unknown as Record<string, unknown>;
+  }
+
+  /**
+   * `table_write_runs` es hypertable comprimida a partir de 7 días
+   * (TableWriteRunsCompression1751000016000) con retention de 365 días: un
+   * COUNT(*) exacto sin filtro obliga a descomprimir todos los chunks del
+   * histórico para contarlos, ignorando el LIMIT — eso es lo que hacía
+   * tardar muchísimo (y a veces expirar el timeout del axios del FE) al abrir
+   * la pestaña sin filtrar, que es el caso por defecto. Sin filtros se usa el
+   * conteo aproximado de Timescale (metadata de catálogo, no descomprime
+   * nada); en cuanto se aplica cualquier filtro se mantiene el COUNT exacto
+   * de siempre, ya acotado por ese filtro.
+   */
+  private async countTotal(qb: SelectQueryBuilder<TableWriteRun>, filters?: Record<string, string>): Promise<number> {
+    if (filters && Object.keys(filters).length > 0) {
+      return qb.clone().getCount();
+    }
+    try {
+      const result: Array<{ count: string }> = await this.repo.query(`SELECT hypertable_approximate_row_count('table_write_runs') AS count`);
+      return Number(result[0]?.count ?? 0);
+    } catch {
+      return qb.clone().getCount();
+    }
   }
 
   async deleteRows(params: DatasetDeleteParams): Promise<{ affected: number }> {

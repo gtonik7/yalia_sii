@@ -51,7 +51,13 @@ export class IngestTableOperation implements OperationHandler, OnModuleInit {
 
     const rows = extractRows(payload);
     if (!rows.length) {
-      return err('EMPTY_PAYLOAD', 'No rows found in payload');
+      // A well-formed event that legitimately parses to zero rows (e.g. a
+      // transform that received a raw/unparsed SFTP payload and returned
+      // `rows: []` rather than crashing) is a no-op, not a failure — an
+      // EMPTY_PAYLOAD error here would fail the saga for a file that was
+      // correctly skipped upstream.
+      this.logger.log(`Ingest no-op table=${tableKey} trace=${ctx.traceId}: payload has 0 rows`);
+      return { status: 'ok', data: { tableKey, inserted: 0, upserted: 0, skippedStale: 0 } };
     }
 
     if (!ctx.connectionId) {
@@ -69,7 +75,7 @@ export class IngestTableOperation implements OperationHandler, OnModuleInit {
     try {
       const res = await this.rows.ingest(template, rows, ctx.connectionId, ctx.traceId);
       this.logger.log(
-        `Ingested table=${tableKey} inserted=${res.inserted} upserted=${res.upserted} trace=${ctx.traceId}`,
+        `Ingested table=${tableKey} inserted=${res.inserted} upserted=${res.upserted} skippedStale=${res.skippedStale} trace=${ctx.traceId}`,
       );
       return { status: 'ok', data: { tableKey, ...res } };
     } catch (e) {

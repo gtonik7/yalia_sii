@@ -44,11 +44,9 @@ import type { Env } from './config/env';
           // de `start:dev`, no solo un paso de despliegue.
           synchronize: false,
           migrations: [join(__dirname, 'migrations', '*{.js,.ts}')],
-          // Ejecuta migraciones al arrancar solo si se pide explícitamente
-          // (p.ej. DB_MIGRATIONS_RUN=true); por defecto se corren como paso de
-          // despliegue con `npm run migration:run`. No forma parte del schema
-          // Zod (deploy-only flag), se lee directo de process.env.
-          migrationsRun: process.env.DB_MIGRATIONS_RUN === 'true',
+          // Las migraciones se ejecutan siempre al arrancar, para que el
+          // esquema quede al día sin depender de un paso manual previo.
+          migrationsRun: true,
         };
       },
     }),

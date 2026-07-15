@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, Get, Param, Patch, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Query, UseGuards } from '@nestjs/common';
 import { DatasetRegistryService } from './dataset-registry.service';
 import { DatasetDescriptor, DatasetPage, DatasetSort, DatasetUpdateResult } from './dataset.types';
 import { MgmtTokenGuard } from '../core/auth/mgmt-token.guard';
@@ -47,6 +47,28 @@ export class DatasetsController {
       filters: Object.keys(filters).length ? filters : undefined,
       sort,
     });
+  }
+
+  /**
+   * Full detail of a single row. For datasets whose list omits heavy columns
+   * (descriptor.hasDetail), the FE calls this when a row is opened to load the
+   * complete record (large jsonb payloads/responses). Opt-in per provider.
+   */
+  @Get(':key/:id')
+  async detail(
+    @Param('key') key: string,
+    @Param('id') id: string,
+    @Query('connectionId') connectionId: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    const provider = await this.registry.resolve(key);
+    if (!provider.getDetail) {
+      throw new BadRequestException(`Dataset '${key}' no admite detalle por fila`);
+    }
+    const row = await provider.getDetail({ id, connectionId });
+    if (!row) {
+      throw new NotFoundException(`No existe el registro '${id}' en '${key}'`);
+    }
+    return row;
   }
 
   /** Delete rows by selection (ids in body) or age (olderThanDays in query). Opt-in per provider. */

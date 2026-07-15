@@ -235,6 +235,97 @@ describe('TableRowsService — per-connection navigation symmetry', () => {
   });
 });
 
+describe('TableRowsService — recencyField ("newest wins" dedup)', () => {
+  let service: TableRowsService;
+
+  beforeEach(() => {
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+  });
+
+  it('keeps the row with the greater recency value across separate ingest calls, regardless of call order', async () => {
+    const tpl = makeTemplate({ idField: 'id', recencyField: 'sourceModifyAt' });
+
+    await service.ingest(tpl, [{ id: 'X', status: 'v2', sourceModifyAt: 200 }], '', 't1');
+    const stale = await service.ingest(tpl, [{ id: 'X', status: 'v1-late-reprocess', sourceModifyAt: 100 }], '', 't2');
+
+    expect(stale.skippedStale).toBe(1);
+    const rows = await allRows('orders');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toMatchObject({ status: 'v2', sourceModifyAt: 200 });
+
+    const fresh = await service.ingest(tpl, [{ id: 'X', status: 'v3', sourceModifyAt: 300 }], '', 't3');
+    expect(fresh.skippedStale).toBe(0);
+    expect(fresh.upserted).toBe(1);
+    const after = await allRows('orders');
+    expect(after[0].data).toMatchObject({ status: 'v3', sourceModifyAt: 300 });
+  });
+
+  it('within a single call, keeps the highest-recency duplicate for the same id', async () => {
+    const tpl = makeTemplate({ idField: 'id', recencyField: 'sourceModifyAt' });
+
+    const res = await service.ingest(
+      tpl,
+      [
+        { id: 'X', status: 'old', sourceModifyAt: 50 },
+        { id: 'X', status: 'newest', sourceModifyAt: 300 },
+        { id: 'X', status: 'middle', sourceModifyAt: 150 },
+      ],
+      '',
+      't1',
+    );
+
+    expect(res.inserted).toBe(1);
+    const rows = await allRows('orders');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toMatchObject({ status: 'newest', sourceModifyAt: 300 });
+  });
+
+  it('without recencyField, falls back to last-occurrence-wins (historical behavior)', async () => {
+    const tpl = makeTemplate({ idField: 'id' });
+
+    await service.ingest(tpl, [{ id: 'X', status: 'v2' }], '', 't1');
+    const res = await service.ingest(tpl, [{ id: 'X', status: 'v1-reprocess' }], '', 't2');
+
+    expect(res.skippedStale).toBe(0);
+    const rows = await allRows('orders');
+    expect(rows[0].data).toMatchObject({ status: 'v1-reprocess' });
+  });
+});
+
+describe('TableRowsService — getStats (reconciliation)', () => {
+  let service: TableRowsService;
+
+  beforeEach(() => {
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+  });
+
+  it('reports rowCount, distinctIds and missingRecency scoped to the template (and optionally the connection)', async () => {
+    const tpl = makeTemplate({ idField: 'id', recencyField: 'sourceModifyAt' });
+    await service.ingest(tpl, [{ id: 'A', sourceModifyAt: 1 }], 'conn-A', 't1');
+    await service.ingest(tpl, [{ id: 'B' }], 'conn-A', 't2'); // no recency stamp
+    await service.ingest(tpl, [{ id: 'C', sourceModifyAt: 2 }], 'conn-B', 't3');
+
+    const all = await service.getStats(tpl);
+    expect(all.rowCount).toBe(3);
+    expect(all.distinctIds).toBe(3);
+    expect(all.missingRecency).toBe(1);
+
+    const scoped = await service.getStats(tpl, 'conn-A');
+    expect(scoped.rowCount).toBe(2);
+    expect(scoped.missingRecency).toBe(1);
+  });
+
+  it('returns null distinctIds/missingRecency when idField/recencyField are unset', async () => {
+    const tpl = makeTemplate({ idField: '' });
+    await service.ingest(tpl, [{ status: 'x' }], '', 't1');
+
+    const stats = await service.getStats(tpl);
+    expect(stats.rowCount).toBe(1);
+    expect(stats.distinctIds).toBeNull();
+    expect(stats.missingRecency).toBeNull();
+  });
+});
+
 describe('TableRowsService — query honors only declared filterable/sortable columns', () => {
   let service: TableRowsService;
   const tpl = makeTemplate({
