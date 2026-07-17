@@ -1137,6 +1137,97 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
     expect(await submissionStatusForDataId('orders', 'A1')).toBe('pending');
     expect(await submissionStatusForDataId('orders', 'B1')).toBe('queued'); // untouched — not in scope
   });
+
+  it('runs a partition\'s chunks in parallel, up to the connection\'s configured `concurrency`', async () => {
+    build();
+    const connId = randomUUID();
+    await dataSource.query(
+      `INSERT INTO source_connections (id, name, base_url, concurrency) VALUES ($1, $2, $3, $4)`,
+      [connId, `conc-test-${connId}`, 'https://sii.test', 3],
+    );
+    try {
+      const concTpl = makeTemplate({
+        idField: 'id',
+        write: { trigger: 'schedule', connections: [{ connectionId: connId, method: 'POST', path: '/invoices' }], batch: { groupBy: [], maxBatchSize: 1 } },
+      });
+      let inFlight = 0;
+      let maxInFlight = 0;
+      sendMock = jest.fn().mockImplementation(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        inFlight--;
+        return { status: 202, data: {} };
+      });
+      const fakeConnections = { resolveById: jest.fn().mockResolvedValue({ ...conn, id: connId }) };
+      const fakeClient = { send: sendMock };
+      service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, { add: jest.fn() } as never, {
+        record: recordRunMock,
+      } as never);
+      templatesStub = { getByKey: jest.fn().mockResolvedValue(concTpl) };
+      batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
+
+      await service.ingest(
+        concTpl,
+        [{ id: 'A1' }, { id: 'A2' }, { id: 'A3' }, { id: 'A4' }, { id: 'A5' }, { id: 'A6' }],
+        connId,
+        't1',
+      );
+
+      await batchService.submitAllQueued(concTpl);
+
+      expect(sendMock).toHaveBeenCalledTimes(6); // maxBatchSize=1 -> 6 chunks
+      expect(maxInFlight).toBeGreaterThan(1); // proves chunks actually overlapped, not strictly sequential
+      expect(maxInFlight).toBeLessThanOrEqual(3); // never exceeds the connection's concurrency=3
+
+      // Regardless of which chunk finishes first, totals/state end up correct —
+      // order isn't asserted here (unlike the concurrency=1 tests above), since
+      // parallel completion order isn't deterministic.
+      const state = await submissionState('orders');
+      expect(state).toHaveLength(6);
+      for (const row of state) expect(row.submission_status).toBe('pending');
+      expect(recordRunMock).toHaveBeenCalledTimes(6);
+    } finally {
+      await dataSource.query(`DELETE FROM source_connections WHERE id = $1`, [connId]);
+    }
+  });
+
+  it('keeps submitting the rest of a partition when one chunk fails, even with concurrency > 1', async () => {
+    build();
+    const connId = randomUUID();
+    await dataSource.query(
+      `INSERT INTO source_connections (id, name, base_url, concurrency) VALUES ($1, $2, $3, $4)`,
+      [connId, `conc-fail-test-${connId}`, 'https://sii.test', 3],
+    );
+    try {
+      const concTpl = makeTemplate({
+        idField: 'id',
+        write: { trigger: 'schedule', connections: [{ connectionId: connId, method: 'POST', path: '/invoices' }], batch: { groupBy: [], maxBatchSize: 1 } },
+      });
+      sendMock = jest.fn().mockImplementation(async (_url: string, _method: string, body: { payload: { id: string }[] }) => {
+        if (body.payload[0].id === 'A2') throw new Error('ECONNREFUSED');
+        return { status: 202, data: {} };
+      });
+      const fakeConnections = { resolveById: jest.fn().mockResolvedValue({ ...conn, id: connId }) };
+      const fakeClient = { send: sendMock };
+      service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, { add: jest.fn() } as never, {
+        record: recordRunMock,
+      } as never);
+      templatesStub = { getByKey: jest.fn().mockResolvedValue(concTpl) };
+      batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
+
+      await service.ingest(concTpl, [{ id: 'A1' }, { id: 'A2' }, { id: 'A3' }], connId, 't1');
+
+      await batchService.submitAllQueued(concTpl);
+
+      expect(sendMock).toHaveBeenCalledTimes(3); // all 3 chunks attempted despite A2's failure
+      expect(await submissionStatusForDataId('orders', 'A1')).toBe('pending');
+      expect(await submissionStatusForDataId('orders', 'A2')).toBe('queued'); // reverted, eligible for retry
+      expect(await submissionStatusForDataId('orders', 'A3')).toBe('pending');
+    } finally {
+      await dataSource.query(`DELETE FROM source_connections WHERE id = $1`, [connId]);
+    }
+  });
 });
 
 describe('TableWriteBatchService — submitByIds (force-submit a selection, table.write.submitRows)', () => {
