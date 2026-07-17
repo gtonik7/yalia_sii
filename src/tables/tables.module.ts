@@ -18,6 +18,7 @@ import { TableWriteBatchService } from './table-write-batch.service';
 import { TableWriteBatchController } from './table-write-batch.controller';
 import { TableWriteSubmitController } from './table-write-submit.controller';
 import { TableStatsController } from './table-stats.controller';
+import { TableResetDeleteBaselineController } from './table-reset-delete-baseline.controller';
 import { TableFindMissingIdsController } from './table-find-missing-ids.controller';
 import { TableBulkDeleteController } from './table-bulk-delete.controller';
 import { TableWriteSummaryController } from './table-write-summary.controller';
@@ -41,6 +42,7 @@ import { QUEUES } from '../core/queues/queues.constants';
         TableWriteBatchController,
         TableWriteSubmitController,
         TableStatsController,
+        TableResetDeleteBaselineController,
         TableFindMissingIdsController,
         TableBulkDeleteController,
         TableWriteSummaryController,

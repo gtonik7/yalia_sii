@@ -5,6 +5,7 @@ import {
   IsObject,
   IsOptional,
   Matches,
+  Max,
   Min,
   IsString,
   ValidateNested,
@@ -44,6 +45,13 @@ export class UpsertSourceConnectionDto {
   @Min(0)
   @IsOptional()
   writeCronIntervalSec?: number;
+
+  /** Nº de lotes enviados en paralelo por "Forzar envío"/barrido. 1/omitido = secuencial. */
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  @IsOptional()
+  concurrency?: number;
 
   @IsString()
   baseUrl!: string;

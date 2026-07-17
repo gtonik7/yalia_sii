@@ -4,9 +4,9 @@ import { DataSource } from 'typeorm';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService } from './table-rows.service';
 import type { TableTemplate } from './entities/table-template.entity';
-import { chunkRows, fetchQueuedRowsCapped, fetchRowsByIds } from './write-sweep-query.util';
+import { chunkRows, fetchQueuedRowsCapped, fetchRowsByIds, runWithConcurrency } from './write-sweep-query.util';
 import type { RowWithConnection } from './write-sweep-query.util';
-import { ParamList } from '../core/sql/sql-params.util';
+import { ParamList, isUuid } from '../core/sql/sql-params.util';
 
 /** Tope por defecto de filas `queued` sacadas por tabla en cada pasada del cron. */
 const DEFAULT_MAX_RECORDS_PER_POLL = 10_000;
@@ -158,9 +158,18 @@ export class TableWriteBatchService {
       partitions.set(key, bucket);
     }
 
+    // Concurrencia por conexión (default 1 = secuencial, como antes). Las
+    // particiones se recorren en su orden original; solo se paralelizan los
+    // lotes DENTRO de una partición, según la `concurrency` de su conexión —
+    // así con todo a 1 el orden y el comportamiento son idénticos al previo.
+    const concurrencyByConn = await this.resolveConcurrencies(
+      [...partitions.values()].map((p) => p.connectionId),
+    );
+
     for (const part of partitions.values()) {
       const chunks = chunkRows(part.rows, maxBatchSize);
-      for (const rowsChunk of chunks) {
+      const concurrency = (part.connectionId && concurrencyByConn.get(part.connectionId)) || 1;
+      const tasks = chunks.map((rowsChunk) => async () => {
         const result = await this.rows.submitGroup(template, rowsChunk, {
           trigger,
           groupValues: groupBy.length ? part.groupValues : null,
@@ -169,7 +178,34 @@ export class TableWriteBatchService {
         if (result?.status === 'error') {
           this.logger.warn(`Submit table=${template.key} batch=${result.batchId} failed: ${result.error}`);
         }
-      }
+      });
+      await runWithConcurrency(tasks, concurrency);
     }
+  }
+
+  /**
+   * Resuelve la `concurrency` configurada por conexión (default 1). Solo mapea
+   * las conexiones con valor > 1; el resto usa 1 en el llamador.
+   */
+  private async resolveConcurrencies(connectionIds: (string | null)[]): Promise<Map<string, number>> {
+    // Solo UUIDs: `source_connections.id` es uuid, y así se descartan ids no
+    // reales (p.ej. fixtures de test). Sin coincidencias → concurrencia 1.
+    const ids = [...new Set(connectionIds.filter((x): x is string => !!x && isUuid(x)))];
+    const map = new Map<string, number>();
+    if (!ids.length) return map;
+    try {
+      const p = new ParamList();
+      const rows: { id: string; concurrency: number | null }[] = await this.dataSource.query(
+        `SELECT id, concurrency FROM source_connections WHERE id = ANY(${p.push(ids)})`,
+        p.all,
+      );
+      for (const row of rows) {
+        if (row.concurrency && row.concurrency > 1) map.set(row.id, row.concurrency);
+      }
+    } catch (err) {
+      // Leer la concurrencia nunca debe abortar el barrido: ante error, secuencial.
+      this.logger.warn(`No se pudo resolver la concurrencia por conexión: ${(err as Error).message}`);
+    }
+    return map;
   }
 }

@@ -71,3 +71,26 @@ export function chunkRows<T>(items: T[], size: number): T[][] {
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
 }
+
+/**
+ * Ejecuta `tasks` con como mucho `limit` en vuelo a la vez. Con `limit <= 1` (o
+ * una sola tarea) corre estrictamente secuencial y en orden — idéntico al bucle
+ * `for await` clásico, de modo que el comportamiento por defecto no cambia.
+ * Con `limit > 1` reparte las tareas entre `limit` workers. Un rechazo se
+ * propaga (misma semántica que el bucle secuencial previo).
+ */
+export async function runWithConcurrency(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+  const n = Math.max(1, Math.floor(limit));
+  if (n === 1 || tasks.length <= 1) {
+    for (const task of tasks) await task();
+    return;
+  }
+  let next = 0;
+  const workers = Array.from({ length: Math.min(n, tasks.length) }, async () => {
+    while (next < tasks.length) {
+      const current = next++;
+      await tasks[current]();
+    }
+  });
+  await Promise.all(workers);
+}

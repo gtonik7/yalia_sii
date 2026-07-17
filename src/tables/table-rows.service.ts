@@ -316,6 +316,28 @@ export class TableRowsService {
     }
 
     /**
+     * Re-baselina el contador global de "borrados no controlados": inserta una fila
+     * `baseline` que sube Σ(affected) del ledger hasta el `n_tup_del` actual, dejando
+     * `uncontrolled = max(0, n_tup_del − Σ)` en 0. Pensado para cuando se borra todo
+     * por fuera de la app (TRUNCATE / SQL directo) y se resincroniza: eso dispara
+     * `n_tup_del` sin registrar borrados voluntarios, inflando el contador de forma
+     * permanente. Append-only (no toca el histórico del ledger) y global —igual que
+     * `n_tup_del`, que es un stat de la tabla física y no admite scope por template.
+     */
+    async resetDeleteBaseline(): Promise<{ deletedSinceLoad: number; voluntaryDeletes: number; uncontrolledDeletes: number; rebaselinedBy: number }> {
+        const [statRow]: { n: number }[] = await this.dataSource.query(`SELECT n_tup_del::int AS n FROM pg_stat_user_tables WHERE relname = 'table_rows'`);
+        const deletedSinceLoad = statRow?.n ?? 0;
+        const [ledgerRow]: { n: number }[] = await this.dataSource.query(`SELECT COALESCE(SUM(affected), 0)::int AS n FROM table_delete_events`);
+        const before = ledgerRow?.n ?? 0;
+        const delta = Math.max(0, deletedSinceLoad - before);
+        if (delta > 0) {
+            await this.dataSource.query(`INSERT INTO table_delete_events (table_key, connection_id, affected, reason) VALUES ('*', NULL, $1, 'baseline')`, [delta]);
+        }
+        const voluntaryDeletes = before + delta;
+        return { deletedSinceLoad, voluntaryDeletes, uncontrolledDeletes: Math.max(0, deletedSinceLoad - voluntaryDeletes), rebaselinedBy: delta };
+    }
+
+    /**
      * Given business-key ids the caller (the hub) knows it sent, reports which
      * are NOT currently present in table_rows for this template+connection —
      * the reconciliation counterpart to getStats()'s coarse global counter,

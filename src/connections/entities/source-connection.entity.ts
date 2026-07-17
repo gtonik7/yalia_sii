@@ -53,6 +53,15 @@ export class SourceConnection {
   @Column({ type: 'int', name: 'write_cron_interval_sec', nullable: true })
   writeCronIntervalSec!: number | null;
 
+  /**
+   * Número de lotes que "Forzar envío"/el barrido de esta conexión envían en
+   * paralelo al sistema externo. 1 (o null) = secuencial (comportamiento
+   * clásico). Mayor = más throughput a costa de más carga concurrente sobre el
+   * destino. Ver TableWriteBatchService.partitionAndSubmit.
+   */
+  @Column({ type: 'int', name: 'concurrency', nullable: true })
+  concurrency!: number | null;
+
   /** Base URL of the external system, e.g. `https://acme.restlets.api.netsuite.com`. */
   @Column({ type: 'varchar', length: 512, name: 'base_url' })
   baseUrl!: string;

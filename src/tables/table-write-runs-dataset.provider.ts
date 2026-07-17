@@ -24,14 +24,17 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     hasDetail: true,
     columns: [
       { key: 'createdAt', label: 'Inicio', type: 'date', sortable: true, filterable: true },
-      { key: 'completedAt', label: 'Fin', type: 'date', filterable: true },
-      { key: 'status', label: 'Estado', type: 'string', filterable: true },
-      { key: 'tableKey', label: 'Tabla', type: 'string', filterable: true },
-      { key: 'connectionName', label: 'Conexión', type: 'string', filterable: true },
-      { key: 'trigger', label: 'Disparador', type: 'string', filterable: true },
-      { key: 'rowCount', label: 'Filas', type: 'number' },
-      { key: 'httpStatus', label: 'HTTP', type: 'number' },
-      { key: 'batchId', label: 'Batch', type: 'string' },
+      { key: 'completedAt', label: 'Fin', type: 'date', sortable: true, filterable: true },
+      { key: 'status', label: 'Estado', type: 'string', sortable: true, filterable: true },
+      { key: 'tableKey', label: 'Tabla', type: 'string', sortable: true, filterable: true },
+      { key: 'connectionName', label: 'Conexión', type: 'string', sortable: true, filterable: true },
+      { key: 'trigger', label: 'Disparador', type: 'string', sortable: true, filterable: true },
+      { key: 'rowCount', label: 'Filas', type: 'number', sortable: true },
+      { key: 'httpStatus', label: 'HTTP', type: 'number', sortable: true },
+      { key: 'batchId', label: 'Batch', type: 'string', sortable: true },
+      // `error_message` es `text` (no jsonb pesado como payload_preview/response_body),
+      // así que a diferencia de esos dos sí puede ir en el listado sin problema de peso.
+      { key: 'errorMessage', label: 'Error', type: 'string' },
     ],
     filters: [
       {
@@ -83,6 +86,12 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     if (params.filters?.completedAt_from) qb.andWhere('r.completedAt >= :completedAtFrom', { completedAtFrom: params.filters.completedAt_from });
     if (params.filters?.completedAt_until) qb.andWhere('r.completedAt <= :completedAtUntil', { completedAtUntil: params.filters.completedAt_until });
 
+    // Orden pedido por el FE, validado contra las columnas marcadas `sortable`
+    // en el descriptor; si no viene o no es válido, más recientes primero.
+    const sortableKeys = new Set(this.descriptor.columns.filter((c) => c.sortable).map((c) => c.key));
+    const sortDir = params.sort?.dir === 'asc' ? 'ASC' : 'DESC';
+    const sortKey = params.sort && sortableKeys.has(params.sort.key) ? params.sort.key : 'createdAt';
+
     const [rows, total] = await Promise.all([
       qb
         .clone()
@@ -92,7 +101,7 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
         // timeout del proxy del hub. El detalle completo se carga bajo demanda
         // en getDetail() al abrir la fila.
         .select(['r.id', ...this.descriptor.columns.map((c) => `r.${c.key}`)])
-        .orderBy('r.createdAt', 'DESC')
+        .orderBy(`r.${sortKey}`, sortDir)
         .skip((params.page - 1) * params.pageSize)
         .take(params.pageSize)
         .getMany(),

@@ -326,6 +326,39 @@ describe('TableRowsService — getStats (reconciliation)', () => {
   });
 });
 
+describe('TableRowsService — resetDeleteBaseline (re-baseline uncontrolled counter)', () => {
+  let service: TableRowsService;
+
+  beforeEach(() => {
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+  });
+
+  // Se afirma solo sobre el retorno del propio reset y sobre el crecimiento del
+  // ledger: `pg_stat_user_tables.n_tup_del` lo actualiza el colector de stats de
+  // Postgres de forma asíncrona, así que re-leerlo tras el reset sería flaky. Estas
+  // invariantes se cumplen sea cual sea el valor absoluto de n_tup_del.
+  it('leaves uncontrolledDeletes at 0 and records the reconciled gap as a baseline ledger row (append-only)', async () => {
+    const [before]: { n: number }[] = await dataSource.query(`SELECT COALESCE(SUM(affected), 0)::int AS n FROM table_delete_events`);
+
+    const res = await service.resetDeleteBaseline();
+
+    // Tras el reset, Σ(affected) cubre el contador físico → "uncontrolled" es 0.
+    expect(res.uncontrolledDeletes).toBe(0);
+    expect(res.voluntaryDeletes).toBe(Math.max(res.deletedSinceLoad, before.n));
+    expect(res.rebaselinedBy).toBeGreaterThanOrEqual(0);
+
+    // El ledger creció exactamente en `rebaselinedBy` (0 si ya estaba conciliado).
+    const [after]: { n: number }[] = await dataSource.query(`SELECT COALESCE(SUM(affected), 0)::int AS n FROM table_delete_events`);
+    expect(after.n - before.n).toBe(res.rebaselinedBy);
+
+    // Un segundo reset sigue dejando el contador conciliado (0). No se afirma
+    // rebaselinedBy===0 porque el colector de stats podría avanzar n_tup_del entre
+    // ambas llamadas; uncontrolledDeletes===0 sí se cumple por construcción siempre.
+    const again = await service.resetDeleteBaseline();
+    expect(again.uncontrolledDeletes).toBe(0);
+  });
+});
+
 describe('TableRowsService — query honors only declared filterable/sortable columns', () => {
   let service: TableRowsService;
   const tpl = makeTemplate({
