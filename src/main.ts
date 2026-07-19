@@ -7,9 +7,13 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 import { ValidationPipe } from '@nestjs/common';
 import { AppModule } from './app.module';
 import { loadEnv } from './config/env';
+import { runMigrations } from './config/run-migrations';
 import { QUEUES, satelliteJobsQueueName } from './core/queues/queues.constants';
 
 async function bootstrap() {
+  // Run pending migrations before starting the app
+  await runMigrations();
+
   const env = loadEnv();
 
   const app = await NestFactory.create<NestFastifyApplication>(
