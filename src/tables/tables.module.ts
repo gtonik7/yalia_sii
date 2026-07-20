@@ -28,6 +28,7 @@ import { TableWriteRunService } from './table-write-run.service';
 import { TableWriteRunsDatasetProvider } from './table-write-runs-dataset.provider';
 import { OperationRegistryModule } from '../operations/operation-registry.module';
 import { ConnectionsModule } from '../connections/connections.module';
+import { OutboxModule } from '../outbox/outbox.module';
 import { QUEUES } from '../core/queues/queues.constants';
 
 /**
@@ -36,7 +37,7 @@ import { QUEUES } from '../core/queues/queues.constants';
  * dataset (DatasetsModule is @Global, so its registry is injectable here).
  */
 @Module({
-    imports: [TypeOrmModule.forFeature([TableTemplate, TableRow, TableWriteRun, TableDeleteEvent]), OperationRegistryModule, ConnectionsModule, BullModule.registerQueue({ name: QUEUES.WRITE_EVENT })],
+    imports: [TypeOrmModule.forFeature([TableTemplate, TableRow, TableWriteRun, TableDeleteEvent]), OperationRegistryModule, ConnectionsModule, OutboxModule, BullModule.registerQueue({ name: QUEUES.WRITE_EVENT })],
     controllers: [
         TableTemplatesController,
         TableWriteBatchController,

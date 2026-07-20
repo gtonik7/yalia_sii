@@ -19,11 +19,17 @@ export interface TriggerableOperation {
     paramsSchema?: Record<string, unknown>;
 }
 
+/** Evento de dominio que este satélite puede emitir como origin de un Flow. */
+export interface OriginOperation {
+    key: string;
+    label: string;
+}
+
 @Controller('v1/satellite')
 @UseGuards(MgmtTokenGuard)
 export class CapabilitiesController {
     @Get('capabilities')
-    list(): { tabs: SatelliteUiSurface[]; triggerableOperations: TriggerableOperation[] } {
+    list(): { tabs: SatelliteUiSurface[]; triggerableOperations: TriggerableOperation[]; originOperations: OriginOperation[] } {
         return {
             // Orden de pestañas: Configuración (genérica del hub) · Conexiones · Tablas.
             tabs: [
@@ -49,6 +55,21 @@ export class CapabilitiesController {
                     kind: 'table-templates',
                     requiresConnection: false,
                 },
+                {
+                    // Observabilidad de solo lectura del outbox de eventos de dominio
+                    // (src/outbox/): pendientes, dead-letter y último error.
+                    key: 'domain-events',
+                    label: 'Eventos de dominio',
+                    kind: 'domain-events',
+                    requiresConnection: false,
+                },
+            ],
+            // Eventos de dominio que este satélite emite hacia `hub-events` (ver
+            // `TableRowsService.buildEmittedEvent`). Deben quedar byte-idénticos a
+            // los strings que emite ese método — no hay enum compartido, es a mano.
+            originOperations: [
+                { key: 'emitida.sent', label: 'Emitida enviada a SII (2xx)' },
+                { key: 'emitida.error', label: 'Emitida con error de envío a SII' },
             ],
             // `table.ingest` (push) needs no trigger.
             triggerableOperations: [

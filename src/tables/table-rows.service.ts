@@ -11,6 +11,8 @@ import { SourceHttpClient } from '../connections/source-http.client';
 import { QUEUES, DEFAULT_JOB_OPTS } from '../core/queues/queues.constants';
 import { WriteEventJobData } from './write-event.types';
 import { TableWriteRunService } from './table-write-run.service';
+import { DomainEmitterService } from '../outbox/domain-emitter.service';
+import type { DomainEvent } from '../outbox/domain-event.types';
 import { assertColumnKey, assertTableKey, escapeLike, isUuid, ParamList, sqlStringLiteral } from '../core/sql/sql-params.util';
 
 /** Loosely matches ISO 8601 date/datetime strings — guards the timestamptz cast in query()'s date-range filter. */
@@ -118,7 +120,8 @@ export class TableRowsService {
         private readonly connections: SourceConnectionsService,
         private readonly client: SourceHttpClient,
         @InjectQueue(QUEUES.WRITE_EVENT) private readonly writeEvent: Queue<WriteEventJobData>,
-        private readonly writeRuns: TableWriteRunService
+        private readonly writeRuns: TableWriteRunService,
+        private readonly emitter: DomainEmitterService
     ) {}
 
     /**
@@ -919,7 +922,8 @@ export class TableRowsService {
         const rule = connectionId ? template.write.connections.find((r) => r.connectionId === connectionId) : undefined;
         if (!rule) {
             const message = `Connection "${connectionId ?? ''}" is not allowed to write back for table "${template.key}"`;
-            await this.markGroupResult(ids, batchId, 'error', message, 'queued');
+            await this.commitOutcome(ids, batchId, 'error', message, 'queued',
+                this.buildEmittedEvent({ template, batchId, connectionId, connectionName: null, trigger, groupValues, rowIds: ids, status: 'error', httpStatus: null, errorMessage: message }));
             await this.recordRun({
                 template,
                 connectionId,
@@ -956,7 +960,8 @@ export class TableRowsService {
             const { status, data } = await this.client.send(conn, { method: rule.method, path: rule.path, query: rule.query }, payloadPreview);
 
             if (status >= 200 && status < 300) {
-                await this.markGroupResult(ids, batchId, 'sent', null, 'pending');
+                await this.commitOutcome(ids, batchId, 'sent', null, 'pending',
+                    this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: ids, status: 'sent', httpStatus: status }));
                 await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'sent', httpStatus: status, batchId, payloadPreview });
                 return { batchId, status: 'sent' };
             }
@@ -964,7 +969,8 @@ export class TableRowsService {
             // Detailed error: include the external system's response body, not just the
             // bare status — "responded 400" alone is useless for diagnosing a rejection.
             const message = `External system responded ${status}: ${truncate(safeStringify(data))}`;
-            await this.markGroupResult(ids, batchId, 'error', message, 'queued');
+            await this.commitOutcome(ids, batchId, 'error', message, 'queued',
+                this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: ids, status: 'error', httpStatus: status, errorMessage: message }));
             await this.recordRun({
                 template,
                 connectionId,
@@ -986,7 +992,8 @@ export class TableRowsService {
             const responseBody = axiosResponseBody(err);
             const base = err instanceof Error ? err.message : String(err);
             const message = responseBody !== null ? `${base}: ${truncate(safeStringify(responseBody))}` : base;
-            await this.markGroupResult(ids, batchId, 'error', message, 'queued');
+            await this.commitOutcome(ids, batchId, 'error', message, 'queued',
+                this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: ids, status: 'error', httpStatus: null, errorMessage: message }));
             await this.recordRun({
                 template,
                 connectionId,
@@ -1043,13 +1050,70 @@ export class TableRowsService {
         }
     }
 
-    private async markGroupResult(ids: string[], batchId: string, writeStatus: 'sent' | 'error', writeError: string | null, submissionStatus: 'pending' | 'queued'): Promise<void> {
-        await this.dataSource.query(
+    private async markGroupResult(ids: string[], batchId: string, writeStatus: 'sent' | 'error', writeError: string | null, submissionStatus: 'pending' | 'queued', manager?: EntityManager): Promise<void> {
+        await (manager ?? this.dataSource).query(
             `UPDATE table_rows
          SET batch_id = $1, write_status = $2, write_error = $3, last_written_at = now(), submission_status = $4
          WHERE id = ANY($5::uuid[])`,
             [batchId, writeStatus, writeError, submissionStatus, ids]
         );
+    }
+
+    /**
+     * Ata en UNA transacción la transición de estado de las filas del batch
+     * (`markGroupResult`) y el spool del evento de dominio saliente
+     * (`emitida.sent`/`emitida.error`) en el outbox. Si el commit falla, ni el
+     * estado ni el evento quedan — no hay estado "enviado" sin su evento, ni
+     * evento de un envío que no se registró. El `recordRun()` (traza best-effort)
+     * queda deliberadamente FUERA, como hasta ahora.
+     */
+    private async commitOutcome(
+        ids: string[],
+        batchId: string,
+        status: 'sent' | 'error',
+        message: string | null,
+        submissionStatus: 'pending' | 'queued',
+        event: DomainEvent
+    ): Promise<void> {
+        await this.dataSource.transaction(async (m) => {
+            await this.markGroupResult(ids, batchId, status, message, submissionStatus, m);
+            await this.emitter.emit(event, m);
+        });
+    }
+
+    /** Construye el evento de dominio saliente de un desenlace de `submitGroup`. */
+    private buildEmittedEvent(args: {
+        template: TableTemplate;
+        batchId: string;
+        connectionId: string | null;
+        connectionName: string | null;
+        trigger: 'event' | 'schedule' | 'manual';
+        groupValues: Record<string, string> | null;
+        rowIds: string[];
+        status: 'sent' | 'error';
+        httpStatus: number | null;
+        errorMessage?: string;
+    }): DomainEvent {
+        return {
+            operation: args.status === 'sent' ? 'emitida.sent' : 'emitida.error',
+            // La conexión de origen resuelve el flow en el hub; el emitter de egress
+            // usa su propia conexión, fijada en el destino del flow.
+            connectionId: args.connectionId ?? '',
+            idempotencyKey: args.batchId,
+            payload: {
+                tableKey: args.template.key,
+                batchId: args.batchId,
+                connectionId: args.connectionId,
+                connectionName: args.connectionName,
+                trigger: args.trigger,
+                groupValues: args.groupValues,
+                rowCount: args.rowIds.length,
+                httpStatus: args.httpStatus,
+                status: args.status,
+                errorMessage: args.errorMessage ?? null,
+                rowIds: args.rowIds,
+            },
+        };
     }
 
     /**
