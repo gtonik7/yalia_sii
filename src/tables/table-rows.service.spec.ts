@@ -7,7 +7,8 @@ import { WriteEventProcessor } from './write-event.processor';
 import { TableWriteBatchService } from './table-write-batch.service';
 import { SiiResultProcessor } from '../callbacks/sii-result.processor';
 import { TableRow } from './entities/table-row.entity';
-import { TableTemplate } from './entities/table-template.entity';
+import { TableColumnDef, TableTemplate } from './entities/table-template.entity';
+import { TableTemplatesService } from './table-templates.service';
 import { DatasetQuery } from '../datasets/dataset.types';
 import type { ResolvedSourceConnection } from '../connections/source-connections.service';
 import type { WriteEventJobData } from './write-event.types';
@@ -177,7 +178,7 @@ describe('TableRowsService — per-connection navigation symmetry', () => {
   let service: TableRowsService;
 
   beforeEach(() => {
-    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
   });
 
   it('scopes rows to the connectionId on ingest and returns them only for that connection', async () => {
@@ -239,7 +240,7 @@ describe('TableRowsService — recencyField ("newest wins" dedup)', () => {
   let service: TableRowsService;
 
   beforeEach(() => {
-    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
   });
 
   it('keeps the row with the greater recency value across separate ingest calls, regardless of call order', async () => {
@@ -292,11 +293,37 @@ describe('TableRowsService — recencyField ("newest wins" dedup)', () => {
   });
 });
 
+describe('TableRowsService — ingest never touches a row already accepted by SII ("correcto")', () => {
+  let service: TableRowsService;
+
+  beforeEach(() => {
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
+  });
+
+  it('leaves data and submission_status untouched on reload, regardless of recencyField', async () => {
+    const tpl = makeTemplate({ idField: 'id', recencyField: 'sourceModifyAt' });
+
+    await service.ingest(tpl, [{ id: 'X', status: 'v1', sourceModifyAt: 100 }], '', 't1');
+    const [{ id: rowId }] = await allRows('orders');
+    await dataSource.query(`UPDATE table_rows SET submission_status = 'correcto' WHERE id = $1`, [rowId]);
+
+    const res = await service.ingest(tpl, [{ id: 'X', status: 'v2-reload', sourceModifyAt: 300 }], '', 't2');
+
+    const rows = await allRows('orders');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toMatchObject({ status: 'v1', sourceModifyAt: 100 }); // untouched despite a newer incoming recency
+    const [state] = await submissionState('orders');
+    expect(state.submission_status).toBe('correcto'); // not reset to 'queued'
+    expect(res.inserted).toBe(0);
+    expect(res.upserted).toBe(0);
+  });
+});
+
 describe('TableRowsService — getStats (reconciliation)', () => {
   let service: TableRowsService;
 
   beforeEach(() => {
-    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
   });
 
   it('reports rowCount, distinctIds and missingRecency scoped to the template (and optionally the connection)', async () => {
@@ -330,7 +357,7 @@ describe('TableRowsService — resetDeleteBaseline (re-baseline uncontrolled cou
   let service: TableRowsService;
 
   beforeEach(() => {
-    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
   });
 
   // Se afirma solo sobre el retorno del propio reset y sobre el crecimiento del
@@ -370,7 +397,7 @@ describe('TableRowsService — query honors only declared filterable/sortable co
   });
 
   beforeEach(async () => {
-    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
     await service.ingest(tpl, [{ id: 'A', status: 'paid', total: 30 }], '', 't');
     await service.ingest(tpl, [{ id: 'B', status: 'open', total: 10 }], '', 't');
     await service.ingest(tpl, [{ id: 'C', status: 'paid', total: 20 }], '', 't');
@@ -406,7 +433,7 @@ describe('TableRowsService — date-range filter on a "date" column', () => {
   });
 
   beforeEach(async () => {
-    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, {} as never, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
     // Mixed precision on purpose — a bare date and a full ISO timestamp both
     // need to compare correctly against each other, which naive text
     // comparison can't guarantee across differing lengths/formats.
@@ -478,7 +505,7 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
     const fakeConnections = { resolveById: resolveByIdMock };
     const fakeClient = { send: sendMock };
     const fakeQueue = { add: enqueueMock };
-    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
     for (const data of seedRows) await service.ingest(tpl, [data], seedConnectionId, 't');
     enqueueMock.mockClear(); // creation never enqueues now, but clear defensively
   }
@@ -496,7 +523,7 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
     expect(enqueueMock).not.toHaveBeenCalled();
   });
 
-  it('saves locally, marks the row queued and enqueues an immediate targeted event send — never calling the external system inline', async () => {
+  it('saves locally, marks the row revisado and enqueues an immediate targeted event send — never calling the external system inline', async () => {
     const tpl = makeTemplate({
       idField: 'id',
       write: { trigger: 'event', connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
@@ -507,11 +534,11 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
     const result = await service.updateAndWrite(tpl, 'conn-1', rowId, { id: 'A1', status: 'reviewed' });
 
     expect(result.row.status).toBe('reviewed');
-    expect(result.external).toEqual({ attempted: true, status: 'queued' });
+    expect(result.external).toEqual({ attempted: true, status: 'revisado' });
     expect(sendMock).not.toHaveBeenCalled(); // no synchronous/inline call to the external system, ever
 
     const [state] = await submissionState('orders');
-    expect(state.submission_status).toBe('queued');
+    expect(state.submission_status).toBe('revisado');
     expect(state.batch_id).toBeNull();
 
     expect(enqueueMock).toHaveBeenCalledTimes(1);
@@ -519,6 +546,26 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
     expect(name).toBe('event');
     expect(data).toEqual({ tableKey: 'orders', rowId, connectionId: 'conn-1' });
     expect(opts).toMatchObject({ jobId: `write-event-${rowId}`, delay: 0 });
+  });
+
+  it('clears a stale write_status/write_error from a prior send when a row is edited again', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { trigger: 'event', connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+    await buildService(tpl, [{ id: 'A1', status: 'draft' }], 'conn-1');
+    const rowId = await firstRowId('orders');
+    await dataSource.query(
+      `UPDATE table_rows SET write_status = 'sent', write_error = NULL, last_written_at = now(), submission_status = 'pending' WHERE id = $1`,
+      [rowId],
+    );
+
+    await service.updateAndWrite(tpl, 'conn-1', rowId, { id: 'A1', status: 'reviewed' });
+
+    const [state] = await submissionState('orders');
+    expect(state.submission_status).toBe('revisado');
+    expect(state.write_status).toBeNull(); // stale 'sent' from before the edit must not linger
+    expect(state.write_error).toBeNull();
   });
 
   it('does not enqueue an event send for a template in schedule mode (relies solely on the internal cron)', async () => {
@@ -531,10 +578,10 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
 
     const result = await service.updateAndWrite(tpl, 'conn-1', rowId, { id: 'A1', status: 'reviewed' });
 
-    expect(result.external).toEqual({ attempted: true, status: 'queued' });
+    expect(result.external).toEqual({ attempted: true, status: 'revisado' });
     expect(enqueueMock).not.toHaveBeenCalled();
     const [state] = await submissionState('orders');
-    expect(state.submission_status).toBe('queued');
+    expect(state.submission_status).toBe('revisado');
   });
 
   it('rejects an edit whose connection has no write.connections rule, without saving anything', async () => {
@@ -555,6 +602,25 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
     const [state] = await submissionState('orders');
     expect(state.submission_status).toBe('queued'); // set by ingest itself, untouched by the rejected edit
     expect(state.write_status).toBeNull(); // never attempted
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(enqueueMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an edit of a row already accepted by SII ("correcto"), without touching data or status', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { trigger: 'event', connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+    await buildService(tpl, [{ id: 'A1', status: 'draft' }], 'conn-1');
+    const rowId = await firstRowId('orders');
+    await dataSource.query(`UPDATE table_rows SET submission_status = 'correcto' WHERE id = $1`, [rowId]);
+
+    await expect(service.updateAndWrite(tpl, 'conn-1', rowId, { id: 'A1', status: 'reviewed' })).rejects.toThrow(
+      /already "correcto"/,
+    );
+
+    const [state] = await submissionState('orders');
+    expect(state.submission_status).toBe('correcto');
     expect(sendMock).not.toHaveBeenCalled();
     expect(enqueueMock).not.toHaveBeenCalled();
   });
@@ -598,7 +664,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     const fakeConnections = { resolveById: resolveByIdMock };
     const fakeClient = { send: sendMock };
     const fakeQueue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
-    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
     for (const data of seedRows) await service.ingest(tpl, [data], 'conn-1', 't');
   }
 
@@ -659,7 +725,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     const fakeConnections = { resolveById: resolveByIdMock };
     const fakeClient = { send: sendMock };
     const fakeQueue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
-    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
     await service.ingest(tpl, [{ id: 'A1', status: 'draft' }], 'conn-1', 't');
     const rows = await allRows('orders');
 
@@ -739,7 +805,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     sendMock = jest.fn().mockResolvedValue({ status: 202, data: {} });
     service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn().mockResolvedValue({ id: 'job-1' }) } as never, {
       record: async () => ({}),
-    } as never);
+    } as never, { emit: async () => {} } as never);
     await service.ingest(perConnTpl, [{ id: 'A1', status: 'draft' }], 'conn-B', 't');
     const rows = await allRows('orders');
 
@@ -757,7 +823,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     sendMock = jest.fn().mockResolvedValue({ status: 202, data: {} });
     service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn().mockResolvedValue({ id: 'job-1' }) } as never, {
       record: async () => ({}),
-    } as never);
+    } as never, { emit: async () => {} } as never);
     await service.ingest(perConnTpl, [{ id: 'A1', status: 'draft' }], 'conn-B', 't');
     const rows = await allRows('orders');
 
@@ -781,7 +847,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     sendMock = jest.fn().mockResolvedValue({ status: 202, data: {} });
     service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn().mockResolvedValue({ id: 'job-1' }) } as never, {
       record: async () => ({}),
-    } as never);
+    } as never, { emit: async () => {} } as never);
     await service.ingest(perConnTpl, [{ id: 'A1', status: 'draft' }], 'conn-C', 't');
     const rows = await allRows('orders');
 
@@ -796,7 +862,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     const recordMock = jest.fn().mockResolvedValue({});
     resolveByIdMock = jest.fn().mockResolvedValue(conn);
     sendMock = jest.fn().mockResolvedValue({ status: 202, data: { ok: true } });
-    service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn() } as never, { record: recordMock } as never);
+    service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn() } as never, { record: recordMock } as never, { emit: async () => {} } as never);
     await service.ingest(tpl, [{ id: 'A1' }, { id: 'A2' }, { id: 'A3' }], 'conn-1', 't');
     const rows = await allRows('orders');
 
@@ -814,7 +880,7 @@ describe('TableRowsService — submitGroup (batch send core)', () => {
     const recordMock = jest.fn().mockResolvedValue({});
     resolveByIdMock = jest.fn().mockResolvedValue(conn);
     sendMock = jest.fn().mockResolvedValue({ status: 400, data: { code: 'E123', reason: 'bad NIF' } });
-    service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn() } as never, { record: recordMock } as never);
+    service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, { send: sendMock } as never, { add: jest.fn() } as never, { record: recordMock } as never, { emit: async () => {} } as never);
     await service.ingest(tpl, [{ id: 'A1' }], 'conn-1', 't');
     const rows = await allRows('orders');
 
@@ -860,7 +926,7 @@ describe('Event send — updateAndWrite enqueue + WriteEventProcessor drain', ()
     sendMock = jest.fn().mockResolvedValue({ status: 202, data: { received: true } });
     const fakeConnections = { resolveById: jest.fn().mockResolvedValue(conn) };
     const fakeClient = { send: sendMock };
-    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, queue as never, { record: async () => ({}) } as never);
+    service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, queue as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
     templatesStub = { findByKey: jest.fn().mockResolvedValue(template) };
     processor = new WriteEventProcessor(dataSource, templatesStub as never, service);
   }
@@ -966,7 +1032,7 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
     recordRunMock = jest.fn().mockResolvedValue({});
     service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, fakeQueue as never, {
       record: recordRunMock,
-    } as never);
+    } as never, { emit: async () => {} } as never);
     templatesStub = { getByKey: jest.fn().mockResolvedValue(tpl) };
     batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
   }
@@ -1089,7 +1155,7 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
     const fakeClient = { send: sendMock };
     service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, fakeClient as never, { add: jest.fn() } as never, {
       record: async () => ({}),
-    } as never);
+    } as never, { emit: async () => {} } as never);
     templatesStub = { getByKey: jest.fn().mockResolvedValue(perConnTpl) };
     batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
 
@@ -1115,7 +1181,7 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
     const fakeClient = { send: sendMock };
     service = new TableRowsService(dataSource, { resolveById: resolveByIdMock } as never, fakeClient as never, { add: jest.fn() } as never, {
       record: async () => ({}),
-    } as never);
+    } as never, { emit: async () => {} } as never);
     templatesStub = { getByKey: jest.fn().mockResolvedValue(perConnTpl) };
     batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
 
@@ -1163,7 +1229,7 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
       const fakeClient = { send: sendMock };
       service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, { add: jest.fn() } as never, {
         record: recordRunMock,
-      } as never);
+      } as never, { emit: async () => {} } as never);
       templatesStub = { getByKey: jest.fn().mockResolvedValue(concTpl) };
       batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
 
@@ -1212,7 +1278,7 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
       const fakeClient = { send: sendMock };
       service = new TableRowsService(dataSource, fakeConnections as never, fakeClient as never, { add: jest.fn() } as never, {
         record: recordRunMock,
-      } as never);
+      } as never, { emit: async () => {} } as never);
       templatesStub = { getByKey: jest.fn().mockResolvedValue(concTpl) };
       batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
 
@@ -1251,7 +1317,7 @@ describe('TableWriteBatchService — submitByIds (force-submit a selection, tabl
     const fakeConnections = { resolveById: resolveById ?? jest.fn().mockResolvedValue(conn) };
     service = new TableRowsService(dataSource, fakeConnections as never, { send: sendMock } as never, { add: jest.fn().mockResolvedValue({ id: 'job-1' }) } as never, {
       record: async () => ({}),
-    } as never);
+    } as never, { emit: async () => {} } as never);
     const templatesStub = { getByKey: jest.fn().mockResolvedValue(tpl) };
     batchService = new TableWriteBatchService(templatesStub as never, service, dataSource);
   }
@@ -1389,8 +1455,11 @@ describe('SiiResultProcessor — inbound SII-result correlation by internal_ref'
     return id;
   }
 
-  function processJob(payload: unknown): Promise<void> {
-    const processor = new SiiResultProcessor(dataSource);
+  function processJob(payload: unknown, columns: TableColumnDef[] = []): Promise<void> {
+    const templatesService = {
+      findByKey: async (key: string) => (key === 'orders' ? makeTemplate({ columns }) : null),
+    } as unknown as TableTemplatesService;
+    const processor = new SiiResultProcessor(dataSource, templatesService);
     return processor.process({ data: { payload } } as never);
   }
 
@@ -1446,5 +1515,30 @@ describe('SiiResultProcessor — inbound SII-result correlation by internal_ref'
 
     const [row] = await dataSource.query(`SELECT submission_status FROM table_rows WHERE id = $1`, [idKnown]);
     expect(row.submission_status).toBe('CORRECTO');
+  });
+
+  it("merges errorCode/errorMessage into data.error_code/data.error_message when the template declares those columns", async () => {
+    const rowId = await seedRow({ status: 'draft' });
+
+    await processJob(
+      { state: 'ERROR', errorCode: '4114', errorMessage: 'bad NIF', internal_ref: rowId },
+      [
+        { key: 'status', label: 'Status', type: 'string' },
+        { key: 'error_code', label: 'Código de error', type: 'string' },
+        { key: 'error_message', label: 'Mensaje de error', type: 'string' },
+      ],
+    );
+
+    const [row] = await dataSource.query(`SELECT data FROM table_rows WHERE id = $1`, [rowId]);
+    expect(row.data).toEqual({ status: 'draft', error_code: '4114', error_message: 'bad NIF' });
+  });
+
+  it('leaves data untouched when the template does not declare error_code/error_message columns', async () => {
+    const rowId = await seedRow({ status: 'draft' });
+
+    await processJob({ state: 'ERROR', errorCode: '4114', errorMessage: 'bad NIF', internal_ref: rowId });
+
+    const [row] = await dataSource.query(`SELECT data FROM table_rows WHERE id = $1`, [rowId]);
+    expect(row.data).toEqual({ status: 'draft' });
   });
 });

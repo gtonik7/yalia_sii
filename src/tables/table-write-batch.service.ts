@@ -69,7 +69,7 @@ export class TableWriteBatchService {
     // accurate "how much am I submitting" number for its UI/toast, without
     // waiting on the actual outbound batches.
     const p = new ParamList();
-    const where = [`table_key = ${p.push(tableKey)}`, `submission_status = 'queued'`];
+    const where = [`table_key = ${p.push(tableKey)}`, `submission_status IN ('queued', 'revisado')`];
     if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
     const [{ count }]: { count: string }[] = await this.dataSource.query(
       `SELECT count(*)::text AS count FROM table_rows WHERE ${where.join(' AND ')}`,
@@ -101,10 +101,13 @@ export class TableWriteBatchService {
 
   /**
    * Force-submit a specific selection of rows (the FE "Forzar envío" over
-   * checked rows), bypassing the poll/debounce. Only rows still eligible —
-   * `submission_status IN ('queued','error')` — are sent; the rest of the
-   * selection is counted as `skipped` so nothing already accepted/pending is
-   * re-presented to the external system. Eligible rows are partitioned exactly
+   * checked rows), bypassing the poll/debounce. Any row not already accepted
+   * by SII (`submission_status <> 'correcto'`) is eligible, including
+   * `'pending'` rows still awaiting a vendor result — the FE requires an
+   * explicit extra confirmation before letting the user re-present those,
+   * since the original callback could still land and race the resubmit. The
+   * rest of the selection (only `'correcto'`/`null`) is counted as `skipped`
+   * so nothing already accepted is re-presented. Eligible rows are partitioned exactly
    * like the queued sweeps (by ingestion connection and by
    * `write.batch.groupBy`), so each partition ships through its own
    * connection and honours `maxBatchSize`.

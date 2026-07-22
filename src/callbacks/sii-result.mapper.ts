@@ -3,6 +3,10 @@ export interface VendorResultItem {
   internalRef: string;
   /** Vendor's own state string, stored verbatim (see note below — no translation layer yet). */
   submissionStatus: string;
+  /** Vendor's error code, when present — mapped into the row's `error_code` field if the template declares one. */
+  errorCode?: string;
+  /** Vendor's error message, when present — mapped into the row's `error_message` field if the template declares one. */
+  errorMessage?: string;
   /** The whole per-item payload, stored verbatim into table_rows.sii_response. */
   raw: Record<string, unknown>;
 }
@@ -41,6 +45,8 @@ export function mapVendorResult(payload: unknown): VendorResultItem[] {
     out.push({
       internalRef: String(internalRef),
       submissionStatus: typeof obj.state === 'string' && obj.state ? obj.state : 'unknown',
+      errorCode: typeof obj.errorCode === 'string' && obj.errorCode ? obj.errorCode : undefined,
+      errorMessage: typeof obj.errorMessage === 'string' && obj.errorMessage ? obj.errorMessage : undefined,
       raw: obj,
     });
   }

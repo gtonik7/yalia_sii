@@ -169,8 +169,8 @@ export interface DatasetDetailParams {
 /** Result of editing a row: the saved row, plus the outcome of any external write-back. */
 export interface DatasetUpdateResult {
     row: Record<string, unknown>;
-    /** `'queued'`: accepted locally, a debounced/scheduled sweep will submit it later — not a transport ack yet. */
-    external?: { attempted: boolean; status?: 'sent' | 'error' | 'queued'; error?: string };
+    /** `'queued'`/`'revisado'`: accepted locally, a debounced/scheduled sweep will submit it later — not a transport ack yet. */
+    external?: { attempted: boolean; status?: 'sent' | 'error' | 'queued' | 'revisado'; error?: string };
 }
 
 /**

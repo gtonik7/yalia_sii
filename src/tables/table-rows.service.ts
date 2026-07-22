@@ -27,17 +27,28 @@ const AGG_ROW_CAP = 5_000;
 /** Máximo de dimensiones de agrupación combinables en un informe ad-hoc. */
 const MAX_AGG_DIMENSIONS = 4;
 
+/**
+ * Sentinel filter value meaning "column has no value" (missing/null/empty).
+ * Mirrored in yalia_hub_fe (NULL_FILTER_VALUE) and yalia_datatable; kept
+ * distinct from '' so it survives the `v === ''` skip in applyFilters().
+ */
+const NULL_FILTER_VALUE = '__null__';
+
 /** Tope defensivo de ids comprobables en una llamada a findMissingIds() (el hub ya capa antes de llamar). */
 const MAX_FIND_MISSING_IDS = 20_000;
 
 /**
- * Derives the same coarse tri-state the records grid paints for `_writeStatus`
- * ('queued'/'sent'/'error') from the physical write_status/write_error/
+ * Derives the same coarse state the records grid paints for `_writeStatus`
+ * ('queued'/'review'/'sent'/'error') from the physical write_status/write_error/
  * submission_status columns, so filter and sort agree with what's displayed.
+ * 'review' (submission_status='revisado') is kept apart from 'queued': a row
+ * a human edited and re-queued, vs. one that just arrived via ingest —
+ * otherwise identical everywhere downstream (write-sweep eligibility, etc.).
  */
 const WRITE_STATUS_CASE_SQL = `CASE
       WHEN (write_error IS NOT NULL AND write_error <> '') OR write_status = 'error' THEN 'error'
       WHEN write_status = 'sent' OR submission_status = 'pending' THEN 'sent'
+      WHEN submission_status = 'revisado' THEN 'review'
       WHEN submission_status = 'queued' THEN 'queued'
       ELSE NULL
     END`;
@@ -203,18 +214,21 @@ export class TableRowsService {
                     // `(xmax = 0)` distinguishes a freshly inserted row from one the
                     // ON CONFLICT updated, so the inserted/upserted split stays accurate.
                     // The WHERE guard on DO UPDATE only overwrites when the incoming row's
-                    // recency is >= the stored one; a row that loses the guard is simply
+                    // recency is >= the stored one AND the stored row isn't already
+                    // `correcto` (SII-accepted rows are immutable — a reload must never
+                    // touch them again, ever); a row that loses the guard is simply
                     // absent from RETURNING (Postgres treats a no-op conflict as neither
                     // inserted nor updated) — that gap is what skippedStale counts.
+                    const correctoGuard = `lower(coalesce(table_rows.submission_status, '')) <> 'correcto'`;
                     const recencyGuard = recencyField
-                        ? ` WHERE COALESCE((table_rows.data ->> ${sqlStringLiteral(recencyField)})::numeric, -1)
+                        ? ` AND COALESCE((table_rows.data ->> ${sqlStringLiteral(recencyField)})::numeric, -1)
                  <= COALESCE((EXCLUDED.data ->> ${sqlStringLiteral(recencyField)})::numeric, -1)`
                         : '';
                     const returned: { id: string; inserted: boolean }[] = await manager.query(
                         `INSERT INTO table_rows (table_key, connection_id, data, trace_id)
              VALUES ${values.join(',')}
              ON CONFLICT (connection_id, ${idExpr}) WHERE table_key = ${tableKeyLit}
-             DO UPDATE SET data = EXCLUDED.data, trace_id = EXCLUDED.trace_id${recencyGuard}
+             DO UPDATE SET data = EXCLUDED.data, trace_id = EXCLUDED.trace_id WHERE ${correctoGuard}${recencyGuard}
              RETURNING id, (xmax = 0) AS inserted`,
                         params
                     );
@@ -483,7 +497,7 @@ export class TableRowsService {
                     continue;
                 }
                 if (k === '_submissionStatus') {
-                    where.push(`submission_status ILIKE ${p.push(`%${escapeLike(v)}%`)}`);
+                    where.push(`submission_status = ${p.push(v)}`);
                     continue;
                 }
                 if (k === '_updatedAt_from') {
@@ -508,7 +522,9 @@ export class TableRowsService {
 
                 if (!filterable.has(k)) continue;
                 const col = template.columns.find((c) => c.key === k);
-                if (col?.type === 'number') {
+                if (v === NULL_FILTER_VALUE) {
+                    where.push(`((data ->> ${p.push(k)}) IS NULL OR (data ->> ${p.push(k)}) = '')`);
+                } else if (col?.type === 'number') {
                     const num = Number(v);
                     // NaN never matches (mirrors the old BSON NaN !== NaN behavior)
                     // instead of letting the ::numeric cast throw.
@@ -840,6 +856,10 @@ export class TableRowsService {
         const dataPh = p.push(JSON.stringify(data));
         const where: string[] = [`id = ${p.push(rowId)}`, `table_key = ${p.push(template.key)}`];
         if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
+        // A row already accepted by SII ('correcto', terminal) is immutable —
+        // the FE already disables the form for it, this is defense in depth
+        // for a direct call to this endpoint.
+        where.push(`lower(coalesce(submission_status, '')) <> 'correcto'`);
 
         // UPDATE returns [rows, rowCount] via TypeORM's raw query() — see deleteRows().
         const [rows]: [TableRowRow[], number] = await this.dataSource.query(
@@ -848,7 +868,17 @@ export class TableRowsService {
             p.all
         );
         const updated = rows[0];
-        if (!updated) throw new NotFoundException(`Row "${rowId}" not found for table "${template.key}"`);
+        if (!updated) {
+            const existsPh = new ParamList();
+            const existsWhere: string[] = [`id = ${existsPh.push(rowId)}`, `table_key = ${existsPh.push(template.key)}`];
+            if (connectionId) existsWhere.push(`connection_id = ${existsPh.push(connectionId)}`);
+            const [existing]: { submission_status: string | null }[] = await this.dataSource.query(
+                `SELECT submission_status FROM table_rows WHERE ${existsWhere.join(' AND ')}`,
+                existsPh.all
+            );
+            if (existing) throw new BadRequestException(`Row "${rowId}" is already "correcto" and cannot be modified`);
+            throw new NotFoundException(`Row "${rowId}" not found for table "${template.key}"`);
+        }
 
         const flatten = (): Record<string, unknown> => ({
             _id: updated.id,
@@ -866,18 +896,21 @@ export class TableRowsService {
         if (!template.write) return { row: flatten() };
 
         const rowConnectionId = connectionId ?? null;
-        await this.markQueued(this.dataSource.manager, template, [updated.id]);
+        // 'revisado' (not 'queued'): distinguishes a manually-corrected row from
+        // one that just arrived via data load, while behaving identically for
+        // every downstream write-sweep/eligibility check.
+        await this.markQueued(this.dataSource.manager, template, [updated.id], 'revisado');
         // Event mode: send exactly this edited row now (array of 1), via an immediate
         // targeted job — never inline (an SII round-trip can outlast the form-save
-        // HTTP request). Schedule mode: leave it `queued` for the internal cron.
+        // HTTP request). Schedule mode: leave it `revisado` for the internal cron.
         if ((template.write.trigger ?? 'event') === 'event') {
             await this.enqueueEventSend(template.key, updated.id, rowConnectionId);
         }
         // markQueued() updates the DB but not this in-memory row — reflect the same
         // fresh-attempt reset here so the response isn't stale.
-        updated.submission_status = 'queued';
+        updated.submission_status = 'revisado';
         updated.sii_response = null;
-        return { row: flatten(), external: { attempted: true, status: 'queued' } };
+        return { row: flatten(), external: { attempted: true, status: 'revisado' } };
     }
 
     /**
@@ -1117,15 +1150,26 @@ export class TableRowsService {
     }
 
     /**
-     * Mark rows as a fresh submission attempt (`submission_status='queued'`,
-     * clearing any stale `batch_id`/`sii_response` from a previous attempt).
-     * Never sends anything itself — creation waits for the internal cron, edits
-     * are pushed separately via `enqueueEventSend`. No-op when the template has
-     * no `write` config or there are no ids.
+     * Mark rows as a fresh submission attempt (`submission_status` reset to
+     * `status` — `'queued'` for rows landing via ingest, `'revisado'` for a
+     * manual edit via updateAndWrite — clearing any stale `batch_id`/
+     * `sii_response` from a previous attempt). `'revisado'` behaves exactly
+     * like `'queued'` everywhere downstream (write-sweep queries, the derived
+     * `_writeStatus`), it only exists so a manually-corrected row is
+     * distinguishable from one that arrived untouched via data load. Never
+     * sends anything itself — creation waits for the internal cron, edits are
+     * pushed separately via `enqueueEventSend`. No-op when the template has no
+     * `write` config or there are no ids.
      */
-    private async markQueued(manager: EntityManager, template: TableTemplate, ids: string[]): Promise<void> {
+    private async markQueued(manager: EntityManager, template: TableTemplate, ids: string[], status: 'queued' | 'revisado' = 'queued'): Promise<void> {
         if (!template.write || !ids.length) return;
-        await manager.query(`UPDATE table_rows SET submission_status = 'queued', batch_id = NULL, sii_response = NULL WHERE id = ANY($1::uuid[])`, [ids]);
+        await manager.query(
+            `UPDATE table_rows
+         SET submission_status = $2, batch_id = NULL, sii_response = NULL,
+             write_status = NULL, write_error = NULL, last_written_at = NULL
+         WHERE id = ANY($1::uuid[])`,
+            [ids, status]
+        );
     }
 
     /**

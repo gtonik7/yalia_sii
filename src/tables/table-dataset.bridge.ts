@@ -66,13 +66,34 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
                     label: 'Estado envío',
                     type: 'string',
                     column: '_writeStatus',
+                    // Derived state (see WRITE_STATUS_CASE_SQL): transport/pipeline status,
+                    // distinct from the vendor's own SII outcome below. 'review' is a
+                    // manually-edited row awaiting the next send, kept apart from 'queued'
+                    // (arrived via ingest, never touched by hand).
                     options: [
                         { value: 'queued', label: 'En cola' },
+                        { value: 'review', label: 'Revisado' },
                         { value: 'sent', label: 'Enviado' },
                         { value: 'error', label: 'Error' },
                     ],
                 },
-                { key: '_submissionStatus', label: 'Estado SII', type: 'string', column: '_submissionStatus' },
+                {
+                    key: '_submissionStatus',
+                    label: 'Estado SII',
+                    type: 'string',
+                    column: '_submissionStatus',
+                    // The vendor's own lifecycle for a submitted document — 'pending' is the
+                    // default right after a successful send, before the inbound callback
+                    // resolves it to one of the terminal states. Pre-send pipeline markers
+                    // ('queued'/'revisado') belong to Estado envío, not here.
+                    options: [
+                        { value: 'pending', label: 'Pendiente' },
+                        { value: 'CORRECTO', label: 'Correcto' },
+                        { value: 'PARCIALMENTE_CORRECTO', label: 'Parcialmente correcto' },
+                        { value: 'INCORRECTO', label: 'Incorrecto' },
+                        { value: 'ERROR', label: 'Error' },
+                    ],
+                },
                 { key: '_updatedAt_from', label: 'Actualizado (desde)', type: 'date', column: '_updatedAt' },
                 { key: '_updatedAt_until', label: 'Actualizado (hasta)', type: 'date', column: '_updatedAt' }
             );

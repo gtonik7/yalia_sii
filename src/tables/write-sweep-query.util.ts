@@ -10,12 +10,15 @@ export interface RowWithConnection {
 
 /**
  * Fetch a specific set of rows by id for manual "force submit" of a selection
- * (distinct from the queued-only sweeps above). Only rows still eligible to
- * submit are returned — `submission_status IN ('queued','error')` — so already
- * accepted/pending rows in the selection are silently skipped (never
- * re-presented). Scoped to `table_key` and, when given, `connection_id`.
- * Returns each row's own `connection_id` so the selection can be partitioned
- * per connection before submitting.
+ * (distinct from the queued-only sweeps above). A row can be re-submitted
+ * unless SII already accepted it (`submission_status = 'CORRECTO'`, terminal).
+ * A row `'pending'` (transport-sent, no vendor result yet) is also eligible
+ * here — the FE surfaces an explicit extra confirmation before letting the
+ * user re-present rows still mid-flight, since a duplicate presentation is
+ * possible if the original callback later lands. Rows that were never queued
+ * (`submission_status IS NULL`) are excluded too. Scoped to `table_key` and,
+ * when given, `connection_id`. Returns each row's own `connection_id` so the
+ * selection can be partitioned per connection before submitting.
  */
 export async function fetchRowsByIds(
   dataSource: DataSource,
@@ -28,9 +31,10 @@ export async function fetchRowsByIds(
   const where = [
     `table_key = ${p.push(tableKey)}`,
     `id = ANY(${p.push(ids)}::uuid[])`,
-    // Case-insensitive: transport failures keep 'queued', while an SII rejection
-    // arrives from the callback as the vendor literal 'ERROR' (uppercase).
-    `lower(submission_status) IN ('queued', 'error')`,
+    `submission_status IS NOT NULL`,
+    // Case-insensitive: internal statuses ('queued'/'pending'/'error') are
+    // lowercase, vendor callback literals ('CORRECTO'/'ERROR') are uppercase.
+    `lower(submission_status) <> 'correcto'`,
   ];
   if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
   const rows: { id: string; data: Record<string, unknown>; connection_id: string | null }[] =
@@ -42,12 +46,13 @@ export async function fetchRowsByIds(
 }
 
 /**
- * Hasta `limit` filas `queued` de una tabla (todos los grupos a la vez),
- * cada una con su `connection_id` para poder particionar en memoria por
- * (conexión, groupBy) igual que `submitByIds`. `ORDER BY created_at` garantiza
- * que se envían primero las más antiguas; el resto (por encima del tope) espera
- * a la siguiente pasada del cron. Scoped a `table_key` y, si se pasa,
- * `connection_id`.
+ * Hasta `limit` filas `queued`/`revisado` de una tabla (todos los grupos a la
+ * vez), cada una con su `connection_id` para poder particionar en memoria por
+ * (conexión, groupBy) igual que `submitByIds`. `'revisado'` (fijado por una
+ * edición manual, ver updateAndWrite) se trata exactamente igual que `'queued'`
+ * a efectos de envío. `ORDER BY created_at` garantiza que se envían primero
+ * las más antiguas; el resto (por encima del tope) espera a la siguiente
+ * pasada del cron. Scoped a `table_key` y, si se pasa, `connection_id`.
  */
 export async function fetchQueuedRowsCapped(
   dataSource: DataSource,
@@ -56,7 +61,7 @@ export async function fetchQueuedRowsCapped(
   connectionId?: string | null,
 ): Promise<RowWithConnection[]> {
   const p = new ParamList();
-  const where = [`table_key = ${p.push(tableKey)}`, `submission_status = 'queued'`];
+  const where = [`table_key = ${p.push(tableKey)}`, `submission_status IN ('queued', 'revisado')`];
   if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
   const rows: { id: string; data: Record<string, unknown>; connection_id: string | null }[] =
     await dataSource.query(

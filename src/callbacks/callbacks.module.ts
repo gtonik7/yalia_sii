@@ -4,9 +4,10 @@ import { SiiCallbackController } from './sii-callback.controller';
 import { SiiResultProcessor } from './sii-result.processor';
 import { QUEUES } from '../core/queues/queues.constants';
 import { ConnectionsModule } from '../connections/connections.module';
+import { TablesModule } from '../tables/tables.module';
 
 @Module({
-  imports: [BullModule.registerQueue({ name: QUEUES.SII_INBOUND }), ConnectionsModule],
+  imports: [BullModule.registerQueue({ name: QUEUES.SII_INBOUND }), ConnectionsModule, TablesModule],
   controllers: [SiiCallbackController],
   providers: [SiiResultProcessor],
 })
