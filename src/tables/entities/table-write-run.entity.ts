@@ -33,9 +33,9 @@ export class TableWriteRun {
   @Column({ type: 'varchar', length: 256, name: 'connection_name', nullable: true })
   connectionName!: string | null;
 
-  /** How the sweep that produced this batch was invoked. */
+  /** How the sweep that produced this batch was invoked. (Legacy rows may still hold `'event'` from before that mode was removed.) */
   @Column({ type: 'varchar', length: 16 })
-  trigger!: 'event' | 'schedule' | 'manual';
+  trigger!: 'schedule' | 'manual';
 
   @Column({ type: 'varchar', length: 16 })
   status!: 'sent' | 'error';

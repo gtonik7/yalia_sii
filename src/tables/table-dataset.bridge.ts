@@ -35,9 +35,10 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
             descriptor: this.toDescriptor(tpl),
             query: (params) => this.rows.query(tpl, params),
             deleteRows: (params) => this.rows.deleteRows(tpl, params),
-            // Only wired when the template declares `write` — editing is strictly
-            // opt-in per table.
-            ...(tpl.write ? { update: (p: DatasetUpdateParams) => this.rows.updateAndWrite(tpl, p.connectionId, p.id, p.data) } : {}),
+            // Only wired when the template declares `write` AND is `editable` —
+            // a table can send its ingested rows out (connections/scheduled/batch)
+            // while keeping the explorer's row detail read-only.
+            ...(tpl.write?.editable ? { update: (p: DatasetUpdateParams) => this.rows.updateAndWrite(tpl, p.connectionId, p.id, p.data) } : {}),
         };
     }
 
@@ -103,9 +104,10 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
             key: t.key,
             label: t.label,
             description: t.description ?? undefined,
-            // Every yalia_sii table's rows are classified by connectionId.
+            // Every yalia_sii table's rows are classified by connectionId. There
+            // is no per-table connection-picker restriction anymore (retired
+            // along with `connectionIds` — it never gated anything server-side).
             perConnection: true,
-            connectionIds: t.connectionIds?.length ? t.connectionIds : undefined,
             columns: t.columns.map((c) => ({
                 key: c.key,
                 label: c.label,
@@ -119,8 +121,17 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
             })),
             filters: filters.length ? filters : undefined,
             defaultSort: t.defaultSort ?? undefined,
-            editable: t.write ? true : undefined,
-            writableConnectionIds: t.write?.connections.map((r) => r.connectionId),
+            editable: t.write?.editable ? true : undefined,
+            // A generic/fallback rule (no connectionId) means every connection can
+            // write back — report "unrestricted" the same way an absent/empty list
+            // already means for the FE (see writableHere in TableRecordsTab.tsx).
+            writableConnectionIds: t.write?.connections.some((r) => !r.connectionId)
+                ? undefined
+                : t.write?.connections.map((r) => r.connectionId!),
+            // Lets the Records tab group/collapse rows by the same columns used to
+            // partition outbound batches (write.batch.groupBy) — purely a display
+            // aid, unrelated to whether `collapse` is also configured.
+            batchGroupByColumns: t.write?.batch?.groupBy?.length ? t.write.batch.groupBy : undefined,
             deletable: true,
             allowBulkDelete: t.allowBulkDelete,
             // Every template exposes `table.count` (read-only, unlike allowBulkDelete

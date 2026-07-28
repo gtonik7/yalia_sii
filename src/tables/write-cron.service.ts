@@ -12,11 +12,10 @@ import { TableWriteBatchService } from './table-write-batch.service';
  * "hub = único scheduler" migration: the send cadence lives on the connection
  * (`writeCronIntervalSec`), not on a hub flow origin.
  *
- * Solo barre las tablas *seleccionadas* para cron: las plantillas con
- * `write.trigger==='schedule'`. Las de modo `'event'` se envían por debounce en
- * la propia edición y quedan fuera de este barrido. Cada tabla saca como mucho
- * `write.batch.maxRecordsPerPoll` filas por pasada (default 10.000); el resto
- * espera a la siguiente.
+ * Solo barre las tablas marcadas como programadas (`write.scheduled === true`);
+ * las no programadas solo se envían con "Forzar envío". Cada tabla saca como
+ * mucho `write.batch.maxRecordsPerPoll` filas por pasada (default 10.000); el
+ * resto espera a la siguiente.
  *
  * A single supervisor `setInterval` ticks at a fixed granularity and, each tick,
  * re-reads the connections from Postgres and runs any whose interval has
@@ -75,12 +74,12 @@ export class WriteCronService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Sweep every schedule-mode table for one connection's queued rows. */
+  /** Sweep every scheduled table for one connection's queued rows. */
   private async sweepConnection(connectionId: string): Promise<void> {
-    // Solo las tablas seleccionadas para cron (write.trigger==='schedule'). Las
-    // 'event' se envían por debounce en la propia edición (enqueueEventSend /
-    // write-event.processor.ts), no por este barrido.
-    const templates = (await this.templates.findAll()).filter((t) => t.write && t.write.trigger === 'schedule');
+    // Solo las tablas marcadas como programadas (write.scheduled === true). El
+    // resto solo se envía con "Forzar envío" (submitByIds); ya no existe el modo
+    // evento de envío en la edición.
+    const templates = (await this.templates.findAll()).filter((t) => t.write && t.write.scheduled === true);
     for (const template of templates) {
       try {
         await this.writeBatch.submitAllQueued(template, 'schedule', connectionId);

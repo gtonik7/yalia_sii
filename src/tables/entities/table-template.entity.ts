@@ -62,6 +62,18 @@ export interface BatchConfig {
      * tabla (todos los grupos), antes de trocear por `maxBatchSize`.
      */
     maxRecordsPerPoll?: number;
+    /**
+     * When present, each outbound chunk is sent as ONE payload item instead of
+     * one item per row: the `groupBy` columns are lifted to the top level
+     * ("cabecera"), every other field is nested per-row under `rowsField`
+     * (default `'rows'`), each still carrying its own `internal_ref`. Requires
+     * `groupBy` to be non-empty — collapsing without a grouping key doesn't
+     * make sense. See `buildCollapsedPayloadItem`.
+     */
+    collapse?: {
+        /** Key under which the per-row differing fields are nested. Default `'rows'`. */
+        rowsField?: string;
+    };
 }
 
 /**
@@ -71,7 +83,15 @@ export interface BatchConfig {
  * different endpoints.
  */
 export interface WriteConnectionRule {
-    connectionId: string;
+    /**
+     * Absent = the generic/fallback rule, used for any connection with no
+     * more specific rule of its own. At most one rule per `connections` array
+     * may omit `connectionId` (enforced in `TableTemplatesService.validate`);
+     * see `resolveWriteRule` in `table-rows.service.ts` for the lookup order
+     * (specific match first, generic fallback second).
+     */
+    connectionId?: string;
+    /** Used for a row's first send (submission_status='queued'), and as the fallback for edits when the update* fields below are absent. */
     method: 'PUT' | 'PATCH' | 'POST';
     /**
      * Path appended to the connection baseUrl. `{id}` is replaced with
@@ -81,28 +101,46 @@ export interface WriteConnectionRule {
     path: string;
     /** Static query params merged into every write request for this connection. */
     query?: Record<string, string>;
+    /** Override used instead of `method` for an edited row (submission_status='revisado'); absent = reuse `method`. */
+    updateMethod?: 'PUT' | 'PATCH' | 'POST';
+    /** Override used instead of `path` for an edited row; absent = reuse `path`. Same `{id}` substitution rules apply. */
+    updatePath?: string;
+    /** Override used instead of `query` for an edited row; absent = reuse `query`. */
+    updateQuery?: Record<string, string>;
 }
 
 /**
- * Binds a table to source connections so an edited row is pushed back to the
- * external system. A row ingested under a connection with no matching rule
- * in `connections` is rejected before it's saved
- * (`TableRowsService.updateAndWrite`) or sent (`TableRowsService.submitGroup`)
- * — there is no implicit fallback connection or endpoint.
+ * Binds a table to source connections so a row is pushed back to the
+ * external system. A row ingested under a connection with no matching
+ * specific rule AND no generic rule in `connections` is rejected before it's
+ * saved (`TableRowsService.updateAndWrite`) or sent
+ * (`TableRowsService.submitGroup`).
  */
 export interface WriteConfig {
     /**
-     * What enqueues a submission sweep: `'event'` debounces a sweep right after
-     * each insert/edit; `'schedule'` relies solely on the hub calling
-     * `table.write.batchSubmit` on a cron. One mode per template — both funnel
-     * into the same submission core, never two parallel code paths.
-     * Optional at this type level only for templates predating this field
-     * (migration backfills `'event'` on save/read, but code consuming this
-     * directly should still treat a missing value as `'event'`); the DTO layer
-     * (`WriteConfigDto`) requires it on every create/update.
+     * When `true`, the connection's internal write cron (`WriteCronService`)
+     * sweeps this table's queued rows on its cadence; when `false`/absent the
+     * table is never swept automatically and only sends via "Forzar envío"
+     * (`submitByIds`). There is no per-edit send anymore — an edit just leaves
+     * the row `revisado`, waiting for a sweep or a manual force-submit.
+     * Optional at this type level only for templates predating the field (the
+     * `WriteConfigTriggerToScheduled` migration backfills it: old `'schedule'`
+     * → `true`, old `'event'` → `false`); the DTO requires it on create/update.
      */
-    trigger?: 'event' | 'schedule';
-    /** One rule per allowed connection — configured one by one, no shared base. */
+    scheduled?: boolean;
+    /**
+     * When `true`, rows are editable in the explorer (subject to each
+     * column's own `readOnly`); when `false`/absent, the row detail is shown
+     * read-only (same view as a table with no `write` at all) but sending
+     * (`connections`/`scheduled`/`batch`) still applies to rows as they're
+     * ingested/re-ingested — editability and outbound sending are independent.
+     * Optional at this type level only for templates predating the field (the
+     * `WriteConfigAddEditable` migration backfills existing writable
+     * templates to `true`, preserving their current behavior); the DTO
+     * requires it on create/update.
+     */
+    editable?: boolean;
+    /** Per-connection rules, plus at most one generic/fallback rule (see `WriteConnectionRule.connectionId`). */
     connections: WriteConnectionRule[];
     /** Present when queued rows must be partitioned before submitting. */
     batch?: BatchConfig;
@@ -128,14 +166,6 @@ export class TableTemplate {
 
     @Column({ type: 'text', nullable: true })
     description!: string | null;
-
-    /**
-     * Restricts which connections expose this table in the explorer (the
-     * connection picker is limited to these ids). Empty/null = exposed on
-     * every connection. Every table's rows are always scoped by connectionId.
-     */
-    @Column({ type: 'jsonb', name: 'connection_ids', nullable: true })
-    connectionIds!: string[] | null;
 
     /**
      * Column key that uniquely identifies a row. When set, ingest upserts by it

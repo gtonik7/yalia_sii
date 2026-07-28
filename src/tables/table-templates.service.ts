@@ -45,16 +45,23 @@ export class TableTemplatesService {
         }
         if (dto.write) {
             const seenConnections = new Set<string>();
+            let seenGeneric = false;
             for (const rule of dto.write.connections) {
-                if (seenConnections.has(rule.connectionId)) {
-                    throw new BadRequestException(`write.connections has a duplicate rule for connection "${rule.connectionId}"`);
+                const label = rule.connectionId ?? '(genérico)';
+                if (!rule.connectionId) {
+                    if (seenGeneric) throw new BadRequestException('write.connections may only have one generic (connectionless) rule');
+                    seenGeneric = true;
+                } else {
+                    if (seenConnections.has(rule.connectionId)) {
+                        throw new BadRequestException(`write.connections has a duplicate rule for connection "${rule.connectionId}"`);
+                    }
+                    seenConnections.add(rule.connectionId);
                 }
-                seenConnections.add(rule.connectionId);
-                if (rule.path.includes('{id}') && !dto.idField) {
+                if ((rule.path.includes('{id}') || rule.updatePath?.includes('{id}')) && !dto.idField) {
                     // Without idField, {id} would resolve against the internal row id,
                     // which is almost never a valid identifier for the external system.
                     throw new BadRequestException(
-                        `write.connections["${rule.connectionId}"].path uses {id} but the table has no idField — it would resolve against the internal row id, not a valid external identifier`
+                        `write.connections["${label}"].path uses {id} but the table has no idField — it would resolve against the internal row id, not a valid external identifier`
                     );
                 }
             }
@@ -116,7 +123,6 @@ export class TableTemplatesService {
             key: dto.key,
             label: dto.label,
             description: dto.description ?? null,
-            connectionIds: dto.connectionIds?.length ? dto.connectionIds : null,
             idField: dto.idField ?? '',
             recencyField: dto.recencyField ?? '',
             columns: dto.columns.map((c) => ({
@@ -137,7 +143,8 @@ export class TableTemplatesService {
             defaultSort: dto.defaultSort ?? null,
             write: dto.write
                 ? {
-                      trigger: dto.write.trigger,
+                      scheduled: dto.write.scheduled,
+                      editable: dto.write.editable,
                       connections: dto.write.connections,
                       batch: dto.write.batch,
                   }

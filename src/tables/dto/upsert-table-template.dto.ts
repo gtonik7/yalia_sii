@@ -91,6 +91,13 @@ export class TableSortDto {
     dir!: 'asc' | 'desc';
 }
 
+export class CollapseConfigDto {
+    @IsOptional()
+    @IsString()
+    @MinLength(1)
+    rowsField?: string;
+}
+
 export class BatchConfigDto {
     @IsArray()
     @ArrayMinSize(1)
@@ -106,12 +113,19 @@ export class BatchConfigDto {
     @IsInt()
     @Min(1)
     maxRecordsPerPoll?: number;
+
+    @IsOptional()
+    @ValidateNested()
+    @Type(() => CollapseConfigDto)
+    collapse?: CollapseConfigDto;
 }
 
 export class WriteConnectionRuleDto {
+    /** Absent = generic/fallback rule (applies to any connection with no specific rule of its own). */
+    @IsOptional()
     @IsString()
     @MinLength(1)
-    connectionId!: string;
+    connectionId?: string;
 
     @IsIn(['PUT', 'PATCH', 'POST'])
     method!: 'PUT' | 'PATCH' | 'POST';
@@ -123,11 +137,32 @@ export class WriteConnectionRuleDto {
     @IsOptional()
     @IsObject()
     query?: Record<string, string>;
+
+    /** Override for edited rows (submission_status='revisado'); absent = reuse `method`. */
+    @IsOptional()
+    @IsIn(['PUT', 'PATCH', 'POST'])
+    updateMethod?: 'PUT' | 'PATCH' | 'POST';
+
+    /** Override for edited rows; absent = reuse `path`. */
+    @IsOptional()
+    @IsString()
+    @MinLength(1)
+    updatePath?: string;
+
+    /** Override for edited rows; absent = reuse `query`. */
+    @IsOptional()
+    @IsObject()
+    updateQuery?: Record<string, string>;
 }
 
 export class WriteConfigDto {
-    @IsIn(['event', 'schedule'])
-    trigger!: 'event' | 'schedule';
+    /** true = the connection's write cron sweeps this table; false = only "Forzar envío". */
+    @IsBoolean()
+    scheduled!: boolean;
+
+    /** true = rows are editable in the explorer; false = read-only detail view, but sending still applies. */
+    @IsBoolean()
+    editable!: boolean;
 
     @IsArray()
     @ArrayMinSize(1)
@@ -153,12 +188,6 @@ export class UpsertTableTemplateDto {
     @IsOptional()
     @IsString()
     description?: string;
-
-    /** The source-connection ids this table is exposed on. Empty/omitted = all connections. */
-    @IsOptional()
-    @IsArray()
-    @IsString({ each: true })
-    connectionIds?: string[];
 
     @IsOptional()
     @IsString()

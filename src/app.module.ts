@@ -15,6 +15,7 @@ import { DatasetsModule } from './datasets/datasets.module';
 import { TablesModule } from './tables/tables.module';
 import { ConnectionsModule } from './connections/connections.module';
 import { CallbacksModule } from './callbacks/callbacks.module';
+import { BackupModule } from './backup/backup.module';
 import type { Env } from './config/env';
 
 @Module({
@@ -73,6 +74,7 @@ import type { Env } from './config/env';
     ConnectionsModule,
     AnnounceModule,
     CallbacksModule,
+    BackupModule,
   ],
 })
 export class AppModule {}

@@ -1,19 +1,16 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { InjectQueue } from '@nestjs/bullmq';
 import { DataSource, EntityManager } from 'typeorm';
-import type { Queue } from 'bullmq';
 import { randomUUID } from 'node:crypto';
-import { TableTemplate } from './entities/table-template.entity';
+import { TableTemplate, WriteConnectionRule } from './entities/table-template.entity';
 import { DatasetDeleteParams, DatasetPage, DatasetQuery, DatasetUpdateResult } from '../datasets/dataset.types';
 import { resolveClave, SourceConnectionsService } from '../connections/source-connections.service';
 import { SourceHttpClient } from '../connections/source-http.client';
-import { QUEUES, DEFAULT_JOB_OPTS } from '../core/queues/queues.constants';
-import { WriteEventJobData } from './write-event.types';
 import { TableWriteRunService } from './table-write-run.service';
 import { DomainEmitterService } from '../outbox/domain-emitter.service';
 import type { DomainEvent } from '../outbox/domain-event.types';
 import { assertColumnKey, assertTableKey, escapeLike, isUuid, ParamList, sqlStringLiteral } from '../core/sql/sql-params.util';
+import { buildCollapsedPayloadItem } from './write-collapse.util';
 
 /** Loosely matches ISO 8601 date/datetime strings — guards the timestamptz cast in query()'s date-range filter. */
 const ISO_DATETIME_RE = String.raw`^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$`;
@@ -71,6 +68,7 @@ interface TableRowRow {
     external_ref: string | null;
     submission_status: string | null;
     sii_response: Record<string, unknown> | null;
+    batch_id: string | null;
 }
 
 /** One table's KPI breakdown — see `TableRowsService.getWriteSummary()`. */
@@ -97,11 +95,27 @@ export interface TableAggregateMetric {
     fn: 'sum' | 'avg' | 'min' | 'max';
 }
 
+export type TableAggregateHavingOp = 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'ne';
+
+/**
+ * One post-aggregation filter condition of an ad-hoc report (SQL HAVING): keeps only
+ * groups where `metric` compares true against `value`. `metric` is either `'count'`
+ * (the always-implicit COUNT(*)) or an index into the report's `metrics` array —
+ * that metric must already be requested. Multiple conditions combine with AND, same
+ * as every other filter DSL in this satellite (see `applyFilters`).
+ */
+export interface TableAggregateHaving {
+    metric: 'count' | number;
+    op: TableAggregateHavingOp;
+    value: number;
+}
+
 export interface TableAggregateParams {
     connectionId?: string;
     filters?: Record<string, string>;
     groupBy: TableAggregateGroupBy[];
     metrics?: TableAggregateMetric[];
+    having?: TableAggregateHaving[];
 }
 
 /**
@@ -130,7 +144,6 @@ export class TableRowsService {
         @InjectDataSource() private readonly dataSource: DataSource,
         private readonly connections: SourceConnectionsService,
         private readonly client: SourceHttpClient,
-        @InjectQueue(QUEUES.WRITE_EVENT) private readonly writeEvent: Queue<WriteEventJobData>,
         private readonly writeRuns: TableWriteRunService,
         private readonly emitter: DomainEmitterService
     ) {}
@@ -641,12 +654,35 @@ export class TableRowsService {
             columns.push({ key: metricKey, label: `${col.label} (${m.fn})`, kind: 'metric' });
         });
 
+        // Post-aggregation filter (HAVING): Postgres can't see SELECT-list aliases in a
+        // real HAVING clause, so instead the group-by is wrapped as a subquery and the
+        // conditions run as a plain WHERE over its already-typed numeric output columns
+        // (`count`, `metric_i`) — no re-casting jsonb, no duplicating the aggregate exprs.
+        const havingOpSql: Record<TableAggregateHavingOp, string> = { gt: '>', gte: '>=', lt: '<', lte: '<=', eq: '=', ne: '<>' };
+        const having = params.having ?? [];
+        const havingWhere = having.map((h) => {
+            if (!havingOpSql[h.op]) throw new BadRequestException(`Operador de filtro de grupo no soportado: ${h.op}`);
+            if (typeof h.value !== 'number' || Number.isNaN(h.value)) throw new BadRequestException('El valor del filtro de grupo debe ser numérico');
+            let col: string;
+            if (h.metric === 'count') {
+                col = 'count';
+            } else {
+                if (!Number.isInteger(h.metric) || h.metric < 0 || h.metric >= metrics.length) {
+                    throw new BadRequestException(`Métrica de filtro de grupo desconocida: ${h.metric}`);
+                }
+                col = `metric_${h.metric}`;
+            }
+            return `${col} ${havingOpSql[h.op]} ${p.push(h.value)}`;
+        });
+
         // Fetch one past the cap so we can tell "exactly at cap" from "truncated".
         const limitPh = p.push(AGG_ROW_CAP + 1);
-        const sql = `SELECT ${selectParts.join(', ')}
+        const innerSql = `SELECT ${selectParts.join(', ')}
         FROM table_rows
         WHERE ${where.join(' AND ')}
-        GROUP BY ${groupExprs.join(', ')}
+        GROUP BY ${groupExprs.join(', ')}`;
+        const sql = `SELECT * FROM (${innerSql}) agg
+        ${havingWhere.length ? `WHERE ${havingWhere.join(' AND ')}` : ''}
         ORDER BY count DESC
         LIMIT ${limitPh}`;
 
@@ -714,7 +750,7 @@ export class TableRowsService {
 
         const [rows, countRows] = await Promise.all([
             this.dataSource.query(
-                `SELECT id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, sii_response
+                `SELECT id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, sii_response, batch_id
          FROM table_rows WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ${limitPh} OFFSET ${offsetPh}`,
                 p.all
             ) as Promise<TableRowRow[]>,
@@ -735,6 +771,7 @@ export class TableRowsService {
                 _externalRef: r.external_ref,
                 _submissionStatus: r.submission_status,
                 _siiResponse: r.sii_response,
+                _batchId: r.batch_id,
             })),
             total,
             page: params.page,
@@ -848,8 +885,16 @@ export class TableRowsService {
     async updateAndWrite(template: TableTemplate, connectionId: string | undefined, rowId: string, data: Record<string, unknown>): Promise<DatasetUpdateResult> {
         if (!isUuid(rowId)) throw new BadRequestException(`Invalid row id "${rowId}"`);
 
-        if (template.write && (!connectionId || !template.write.connections.some((r) => r.connectionId === connectionId))) {
-            throw new BadRequestException(`Connection "${connectionId ?? ''}" is not allowed to write back for table "${template.key}"`);
+        if (template.write) {
+            // Defense in depth: the dataset only registers `update` when
+            // `editable` is true (see table-dataset.bridge.ts), but this method
+            // is also reachable directly, so re-check here.
+            if (!template.write.editable) {
+                throw new BadRequestException(`Table "${template.key}" is not editable`);
+            }
+            if (!connectionId || !resolveWriteRule(template.write.connections, connectionId)) {
+                throw new BadRequestException(`Connection "${connectionId ?? ''}" is not allowed to write back for table "${template.key}"`);
+            }
         }
 
         const p = new ParamList();
@@ -895,17 +940,13 @@ export class TableRowsService {
 
         if (!template.write) return { row: flatten() };
 
-        const rowConnectionId = connectionId ?? null;
         // 'revisado' (not 'queued'): distinguishes a manually-corrected row from
         // one that just arrived via data load, while behaving identically for
-        // every downstream write-sweep/eligibility check.
+        // every downstream write-sweep/eligibility check. `markQueued` also
+        // (re)stamps `group_id` from the row's current `groupBy` values.
+        // Editing never sends anymore: the row waits for the connection's write
+        // cron (if the table is `scheduled`) or an explicit "Forzar envío".
         await this.markQueued(this.dataSource.manager, template, [updated.id], 'revisado');
-        // Event mode: send exactly this edited row now (array of 1), via an immediate
-        // targeted job — never inline (an SII round-trip can outlast the form-save
-        // HTTP request). Schedule mode: leave it `revisado` for the internal cron.
-        if ((template.write.trigger ?? 'event') === 'event') {
-            await this.enqueueEventSend(template.key, updated.id, rowConnectionId);
-        }
         // markQueued() updates the DB but not this in-memory row — reflect the same
         // fresh-attempt reset here so the response isn't stale.
         updated.submission_status = 'revisado';
@@ -931,7 +972,7 @@ export class TableRowsService {
     async submitGroup(
         template: TableTemplate,
         rows: { id: string; data: Record<string, unknown> }[],
-        opts?: { trigger?: 'event' | 'schedule' | 'manual'; groupValues?: Record<string, string> | null; connectionId?: string | null }
+        opts?: { trigger?: 'schedule' | 'manual'; groupValues?: Record<string, string> | null; connectionId?: string | null; markRowIds?: string[]; phase?: SendPhase }
     ): Promise<{ batchId: string; status: 'sent' | 'error'; error?: string } | null> {
         if (!rows.length) return null;
         if (!template.write) {
@@ -939,12 +980,23 @@ export class TableRowsService {
         }
 
         const batchId = randomUUID();
+        // `rows` is the full payload (with `collapse`, the whole group incl.
+        // already-`correcto` context lines). `markIds` is the subset whose
+        // status we actually advance — when omitted, every payload row is marked
+        // (cron/non-collapse). Everything that WRITES status uses `markIds`, so
+        // context lines are shipped but never re-marked or downgraded on error.
         const ids = rows.map((r) => r.id);
-        const trigger = opts?.trigger ?? template.write.trigger ?? 'event';
+        const markIds = opts?.markRowIds ?? ids;
+        const trigger = opts?.trigger ?? 'schedule';
         const groupValues = opts?.groupValues ?? null;
         // Each group submits through the connection its rows were ingested under
-        // (see `partitionAndSubmit`) — there is no fallback connection anymore.
+        // (see `partitionAndSubmit`), resolved to a rule via `resolveWriteRule`
+        // (specific match first, generic/fallback rule second).
         const connectionId = opts?.connectionId ?? null;
+        // 'create' unless the caller (partitionAndSubmit) says otherwise — rows
+        // fetched by direct id/legacy callers with no phase info default to
+        // 'create', matching the pre-existing single-target behavior.
+        const phase = opts?.phase ?? 'create';
         let connectionName: string | null = null;
 
         // Defense in depth: `updateAndWrite` already blocks edits from a
@@ -952,18 +1004,18 @@ export class TableRowsService {
         // can be dropped from the allowlist after rows are queued (or via the
         // cron/force-submit paths, which don't go through updateAndWrite) — so
         // the gate is re-checked at the one place that actually sends.
-        const rule = connectionId ? template.write.connections.find((r) => r.connectionId === connectionId) : undefined;
+        const rule = resolveWriteRule(template.write.connections, connectionId);
         if (!rule) {
             const message = `Connection "${connectionId ?? ''}" is not allowed to write back for table "${template.key}"`;
-            await this.commitOutcome(ids, batchId, 'error', message, 'queued',
-                this.buildEmittedEvent({ template, batchId, connectionId, connectionName: null, trigger, groupValues, rowIds: ids, status: 'error', httpStatus: null, errorMessage: message }));
+            await this.commitOutcome(markIds, batchId, 'error', message, 'queued',
+                this.buildEmittedEvent({ template, batchId, connectionId, connectionName: null, trigger, groupValues, rowIds: markIds, status: 'error', httpStatus: null, errorMessage: message }));
             await this.recordRun({
                 template,
                 connectionId,
                 connectionName: null,
                 trigger,
                 groupValues,
-                rowCount: rows.length,
+                rowCount: markIds.length,
                 status: 'error',
                 httpStatus: null,
                 errorMessage: message,
@@ -979,38 +1031,49 @@ export class TableRowsService {
         // that's what correlates the callback to a row, instead of relying on a
         // vendor-issued id plucked from the response.
         const excludedKeys = new Set(template.columns.filter((c) => c.excludeFromPayload).map((c) => c.key));
-        const payload = rows.map((r) => ({
-            internal_ref: r.id,
-            ...(toCamelCase(excludedKeys.size ? Object.fromEntries(Object.entries(r.data).filter(([k]) => !excludedKeys.has(k))) : r.data) as Record<string, unknown>),
+        const camelRows = rows.map((r) => ({
+            id: r.id,
+            data: toCamelCase(excludedKeys.size ? Object.fromEntries(Object.entries(r.data).filter(([k]) => !excludedKeys.has(k))) : r.data) as Record<string, unknown>,
         }));
+        // When `collapse` is configured, the whole chunk ships as ONE payload
+        // item (the `groupBy` columns lifted to the top level, the rest
+        // nested per-row) instead of one item per row — see buildCollapsedPayloadItem.
+        const collapse = template.write.batch?.collapse;
+        const groupByKeys = (template.write.batch?.groupBy || []).map((key) => key.replace(/_([a-z])/g, (_, char) => char.toUpperCase()));
+        const payload = collapse
+            ? [buildCollapsedPayloadItem(camelRows, groupByKeys, collapse.rowsField || 'rows', batchId)]
+            : camelRows.map((r) => ({ internal_ref: r.id, ...r.data }));
         let payloadPreview: unknown;
 
         try {
-            const conn = await this.connections.resolveById(rule.connectionId);
+            // Always resolve the actual ingest connection (not `rule.connectionId`,
+            // which is absent for the generic/fallback rule) — the rule only
+            // supplies method/path/query, the connection supplies baseUrl/auth.
+            const conn = await this.connections.resolveById(connectionId!);
             connectionName = conn.name;
             const clientId = resolveClave(conn);
             payloadPreview = { clientId, payload };
-            const { status, data } = await this.client.send(conn, { method: rule.method, path: rule.path, query: rule.query }, payloadPreview);
+            const { status, data } = await this.client.send(conn, resolveSendTarget(rule, phase), payloadPreview);
 
             if (status >= 200 && status < 300) {
-                await this.commitOutcome(ids, batchId, 'sent', null, 'pending',
-                    this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: ids, status: 'sent', httpStatus: status }));
-                await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: rows.length, status: 'sent', httpStatus: status, batchId, payloadPreview });
+                await this.commitOutcome(markIds, batchId, 'sent', null, 'pending',
+                    this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: markIds, status: 'sent', httpStatus: status }));
+                await this.recordRun({ template, connectionId, connectionName, trigger, groupValues, rowCount: markIds.length, status: 'sent', httpStatus: status, batchId, payloadPreview });
                 return { batchId, status: 'sent' };
             }
 
             // Detailed error: include the external system's response body, not just the
             // bare status — "responded 400" alone is useless for diagnosing a rejection.
             const message = `External system responded ${status}: ${truncate(safeStringify(data))}`;
-            await this.commitOutcome(ids, batchId, 'error', message, 'queued',
-                this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: ids, status: 'error', httpStatus: status, errorMessage: message }));
+            await this.commitOutcome(markIds, batchId, 'error', message, 'queued',
+                this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: markIds, status: 'error', httpStatus: status, errorMessage: message }));
             await this.recordRun({
                 template,
                 connectionId,
                 connectionName,
                 trigger,
                 groupValues,
-                rowCount: rows.length,
+                rowCount: markIds.length,
                 status: 'error',
                 httpStatus: status,
                 errorMessage: message,
@@ -1025,15 +1088,15 @@ export class TableRowsService {
             const responseBody = axiosResponseBody(err);
             const base = err instanceof Error ? err.message : String(err);
             const message = responseBody !== null ? `${base}: ${truncate(safeStringify(responseBody))}` : base;
-            await this.commitOutcome(ids, batchId, 'error', message, 'queued',
-                this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: ids, status: 'error', httpStatus: null, errorMessage: message }));
+            await this.commitOutcome(markIds, batchId, 'error', message, 'queued',
+                this.buildEmittedEvent({ template, batchId, connectionId, connectionName, trigger, groupValues, rowIds: markIds, status: 'error', httpStatus: null, errorMessage: message }));
             await this.recordRun({
                 template,
                 connectionId,
                 connectionName,
                 trigger,
                 groupValues,
-                rowCount: rows.length,
+                rowCount: markIds.length,
                 status: 'error',
                 httpStatus: null,
                 errorMessage: message,
@@ -1053,7 +1116,7 @@ export class TableRowsService {
         template: TableTemplate;
         connectionId: string | null;
         connectionName: string | null;
-        trigger: 'event' | 'schedule' | 'manual';
+        trigger: 'schedule' | 'manual';
         groupValues: Record<string, string> | null;
         rowCount: number;
         status: 'sent' | 'error';
@@ -1120,7 +1183,7 @@ export class TableRowsService {
         batchId: string;
         connectionId: string | null;
         connectionName: string | null;
-        trigger: 'event' | 'schedule' | 'manual';
+        trigger: 'schedule' | 'manual';
         groupValues: Record<string, string> | null;
         rowIds: string[];
         status: 'sent' | 'error';
@@ -1157,30 +1220,74 @@ export class TableRowsService {
      * like `'queued'` everywhere downstream (write-sweep queries, the derived
      * `_writeStatus`), it only exists so a manually-corrected row is
      * distinguishable from one that arrived untouched via data load. Never
-     * sends anything itself — creation waits for the internal cron, edits are
-     * pushed separately via `enqueueEventSend`. No-op when the template has no
-     * `write` config or there are no ids.
+     * sends anything itself — creation waits for the connection's write cron,
+     * an edit waits for that cron or an explicit "Forzar envío". Also
+     * (re)stamps `group_id` from the row's current `write.batch.groupBy` values
+     * (NULL when the table doesn't group), so a group can later be shipped
+     * complete (see `fetchGroupMembers` / `submitByIds`). No-op when the
+     * template has no `write` config or there are no ids.
      */
     private async markQueued(manager: EntityManager, template: TableTemplate, ids: string[], status: 'queued' | 'revisado' = 'queued'): Promise<void> {
         if (!template.write || !ids.length) return;
+        const groupIdSql = buildGroupIdSql(template.write.batch?.groupBy ?? []);
         await manager.query(
             `UPDATE table_rows
          SET submission_status = $2, batch_id = NULL, sii_response = NULL,
-             write_status = NULL, write_error = NULL, last_written_at = NULL
+             write_status = NULL, write_error = NULL, last_written_at = NULL,
+             group_id = ${groupIdSql}
          WHERE id = ANY($1::uuid[])`,
             [ids, status]
         );
     }
+}
 
-    /**
-     * Enqueue an immediate, row-targeted send of a single edited row (event mode).
-     * `delay: 0` so it fires right away; a stable `jobId` per row dedupes rapid
-     * re-edits while one is still in flight. The processor re-checks the row is
-     * still `queued` before sending, so a stale/duplicate job simply no-ops.
-     */
-    private async enqueueEventSend(tableKey: string, rowId: string, connectionId: string | null): Promise<void> {
-        await this.writeEvent.add('event', { tableKey, rowId, connectionId }, { ...DEFAULT_JOB_OPTS, jobId: `write-event-${rowId}`, delay: 0 });
+/**
+ * Resolves which `WriteConnectionRule` applies for a given connection: a rule
+ * whose `connectionId` matches exactly, falling back to the generic rule
+ * (the one entry with no `connectionId`, if any). Returns `undefined` when
+ * neither exists — the caller treats that as "not allowed to write back".
+ */
+function resolveWriteRule(connections: WriteConnectionRule[], connectionId: string | null): WriteConnectionRule | undefined {
+    // No ingest connection to send through at all — the generic rule can't help either.
+    if (!connectionId) return undefined;
+    return connections.find((r) => r.connectionId === connectionId) ?? connections.find((r) => !r.connectionId);
+}
+
+/** A row's send phase: 'create' for its first-ever send (submission_status='queued'), 'update' for an edit (submission_status='revisado'). */
+export type SendPhase = 'create' | 'update';
+
+/**
+ * Resolves the effective method/path/query for a rule given the send phase.
+ * `phase === 'update'` uses the rule's `update*` overrides, falling back to
+ * the base `method`/`path`/`query` field-by-field when an override is absent
+ * — so a rule with no `update*` fields at all behaves identically for both
+ * phases (the pre-existing behavior).
+ */
+function resolveSendTarget(rule: WriteConnectionRule, phase: SendPhase): { method: WriteConnectionRule['method']; path: string; query?: Record<string, string> } {
+    if (phase === 'update') {
+        return { method: rule.updateMethod ?? rule.method, path: rule.updatePath ?? rule.path, query: rule.updateQuery ?? rule.query };
     }
+    return { method: rule.method, path: rule.path, query: rule.query };
+}
+
+/**
+ * SQL expression that materializes a row's `group_id`: an md5 of `connection_id`
+ * and each `write.batch.groupBy` column value, joined by an ASCII unit separator
+ * (chr(31), which can't appear in the JSON string values). Rows sharing the same
+ * groupBy values under the same connection collapse to the same id. Returns the
+ * literal `NULL` when there are no groupBy columns. Column keys are validated
+ * (assertColumnKey) since they are interpolated as literal SQL — MUST stay
+ * byte-for-byte identical to the backfill in the `AddTableRowsGroupId` migration
+ * so a re-stamp on edit never disagrees with the backfilled value.
+ */
+function buildGroupIdSql(groupBy: string[]): string {
+    if (!groupBy.length) return 'NULL';
+    const parts = [`coalesce(connection_id, '')`];
+    for (const key of groupBy) {
+        assertColumnKey(key);
+        parts.push(`coalesce(data ->> ${sqlStringLiteral(key)}, '')`);
+    }
+    return `md5(${parts.join(` || chr(31) || `)})`;
 }
 
 /**

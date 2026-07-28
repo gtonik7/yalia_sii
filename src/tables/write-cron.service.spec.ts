@@ -8,7 +8,7 @@ function tpl(over: Partial<TableTemplate>): TableTemplate {
   return { key: 'k', label: 'k', write: null, ...over } as TableTemplate;
 }
 
-const writeCfg = { connectionId: 'x', method: 'POST' as const, path: '/', trigger: 'schedule' as const };
+const writeCfg = { scheduled: true, editable: true, connections: [{ connectionId: 'x', method: 'POST' as const, path: '/' }] };
 
 /**
  * Pure unit spec — no DB, no Redis. The internal cron's whole job is: pick the
@@ -26,19 +26,19 @@ describe('WriteCronService — internal per-connection write cron', () => {
     return { service, connections, templates, submit };
   }
 
-  it('sweeps a due connection once per schedule-mode table (skipping no-write and event-mode templates)', async () => {
+  it('sweeps a due connection once per scheduled table (skipping no-write and non-scheduled templates)', async () => {
     const submit = jest.fn().mockResolvedValue(undefined);
     const templates = [
       tpl({ key: 'emitidas', write: writeCfg }),
       tpl({ key: 'no-write', write: null }),
-      tpl({ key: 'event-mode', write: { ...writeCfg, trigger: 'event' } }),
+      tpl({ key: 'manual', write: { ...writeCfg, scheduled: false } }),
     ];
     const { service } = build({ conns: [{ id: 'c1', intervalSec: 10 }], templates, submit });
 
     await service['supervisorTick']();
     await flush();
 
-    // Only the schedule-mode template is swept; no-write and event-mode are skipped.
+    // Only the scheduled table is swept; no-write and non-scheduled are skipped.
     expect(submit).toHaveBeenCalledTimes(1);
     expect(submit).toHaveBeenCalledWith(templates[0], 'schedule', 'c1');
   });

@@ -86,10 +86,9 @@ describe('TableIndexManagerService — write.batch.groupBy composite index', () 
   it('creates a composite index over submission_status + groupBy columns', async () => {
     const tpl = makeTemplate({
       write: {
-        connectionId: 'conn-1',
-        method: 'POST',
-        path: '/invoices',
-        trigger: 'event',
+        scheduled: false,
+        editable: true,
+        connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
         batch: { groupBy: ['counterpartyTaxId', 'invoiceType'] },
       },
     });
@@ -110,10 +109,9 @@ describe('TableIndexManagerService — write.batch.groupBy composite index', () 
   it('drops the old group index and creates a new one when groupBy is renamed', async () => {
     const before = makeTemplate({
       write: {
-        connectionId: 'conn-1',
-        method: 'POST',
-        path: '/invoices',
-        trigger: 'event',
+        scheduled: false,
+        editable: true,
+        connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
         batch: { groupBy: ['counterpartyTaxId'] },
       },
     });
@@ -123,10 +121,9 @@ describe('TableIndexManagerService — write.batch.groupBy composite index', () 
 
     const after = makeTemplate({
       write: {
-        connectionId: 'conn-1',
-        method: 'POST',
-        path: '/invoices',
-        trigger: 'event',
+        scheduled: false,
+        editable: true,
+        connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
         batch: { groupBy: ['invoiceType'] },
       },
     });

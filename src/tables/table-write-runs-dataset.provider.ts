@@ -48,6 +48,7 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
       },
       { key: 'tableKey', label: 'Tabla', type: 'string' },
       { key: 'connectionName', label: 'Conexión', type: 'string' },
+      { key: 'batchId', label: 'Batch', type: 'string' },
       {
         key: 'trigger',
         label: 'Disparador',
@@ -81,6 +82,7 @@ export class TableWriteRunsDatasetProvider implements DatasetProvider, OnModuleI
     if (params.filters?.status) qb.andWhere('r.status = :status', { status: params.filters.status });
     if (params.filters?.trigger) qb.andWhere('r.trigger = :trigger', { trigger: params.filters.trigger });
     if (params.filters?.connectionName) qb.andWhere('r.connectionName ILIKE :connectionName', { connectionName: `%${params.filters.connectionName}%` });
+    if (params.filters?.batchId) qb.andWhere('r.batchId ILIKE :batchId', { batchId: `%${params.filters.batchId}%` });
     if (params.filters?.createdAt_from) qb.andWhere('r.createdAt >= :createdAtFrom', { createdAtFrom: params.filters.createdAt_from });
     if (params.filters?.createdAt_until) qb.andWhere('r.createdAt <= :createdAtUntil', { createdAtUntil: params.filters.createdAt_until });
     if (params.filters?.completedAt_from) qb.andWhere('r.completedAt >= :completedAtFrom', { completedAtFrom: params.filters.completedAt_from });

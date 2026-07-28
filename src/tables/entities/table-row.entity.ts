@@ -73,6 +73,18 @@ export class TableRow {
   @Column({ type: 'varchar', length: 64, name: 'batch_id', nullable: true })
   batchId!: string | null;
 
+  /**
+   * Grouping key materialized when the row is (re)queued (see
+   * `TableRowsService.markQueued`): an md5 of `connection_id` + the values of
+   * the template's `write.batch.groupBy` columns. Rows that belong to the same
+   * group share this value, so forcing the send of one row can pull in its
+   * siblings and ship the group complete (see `submitByIds` /
+   * `fetchGroupMembers`). NULL when the table doesn't group (`groupBy` empty)
+   * or has no write config. Distinct from `batch_id` (the per-send outbound id).
+   */
+  @Column({ type: 'varchar', length: 64, name: 'group_id', nullable: true })
+  groupId!: string | null;
+
   /** Last raw callback payload for this row; overwritten wholesale on every callback (no history kept). */
   @Column({ type: 'jsonb', name: 'sii_response', nullable: true })
   siiResponse!: Record<string, unknown> | null;

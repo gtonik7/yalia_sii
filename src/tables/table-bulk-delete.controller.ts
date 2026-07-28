@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, ForbiddenException, HttpCode, Po
 import { IsBoolean, IsObject, IsOptional, IsString } from 'class-validator';
 import { MgmtTokenGuard } from '../core/auth/mgmt-token.guard';
 import { TableTemplatesService } from './table-templates.service';
-import { TableRowsService } from './table-rows.service';
+import { OperationRunService } from './operation-run.service';
 
 class TableBulkDeleteParamsDto {
     @IsOptional()
@@ -51,21 +51,25 @@ class TableBulkDeleteDto {
  * never be able to wipe a whole table:
  *   POST /v1/operations/table.bulkDelete/trigger
  *     { params:{ tableKey, filters, connectionId, confirm:true } }
- *   → { deletedCount }.
- * Same `/satellites/:key/operations/:operationKey/trigger` hub proxy as
- * `table.stats` (see TableStatsController).
+ *   → { runId } (202).
+ * El borrado real corre en background (`MaintenanceProcessor`) porque un DELETE
+ * sobre `table_rows` (compartida, >1M filas) puede superar el techo de timeout del
+ * proxy del hub (30 s) — y una desconexión NO cancela el DELETE, dejando al usuario
+ * sin saber el desenlace. La validación (confirm/allowBulkDelete/filtros) es síncrona
+ * para dar feedback inmediato; sólo la ejecución se difiere. El FE pollea
+ * `GET /v1/operation-runs/:runId` → `result.deletedCount`.
  */
 @UseGuards(MgmtTokenGuard)
 @Controller('v1/operations/table.bulkDelete')
 export class TableBulkDeleteController {
     constructor(
         private readonly templates: TableTemplatesService,
-        private readonly rows: TableRowsService
+        private readonly runs: OperationRunService
     ) {}
 
     @Post('trigger')
-    @HttpCode(200)
-    async trigger(@Body() dto: TableBulkDeleteDto): Promise<{ deletedCount: number }> {
+    @HttpCode(202)
+    async trigger(@Body() dto: TableBulkDeleteDto): Promise<{ runId: string }> {
         const tableKey = dto.tableKey ?? dto.params?.tableKey;
         if (!tableKey) {
             throw new BadRequestException('tableKey is required (top level or params.tableKey)');
@@ -86,7 +90,7 @@ export class TableBulkDeleteController {
         }
 
         const connectionId = dto.connectionId ?? dto.params?.connectionId;
-        const { affected } = await this.rows.deleteRows(template, { connectionId, filters: nonEmptyFilters });
-        return { deletedCount: affected };
+        const run = await this.runs.create('table.bulkDelete', tableKey, { tableKey, connectionId, filters: nonEmptyFilters });
+        return { runId: run.id };
     }
 }

@@ -36,7 +36,8 @@ describe('TableTemplatesService — validate() write.batch.groupBy', () => {
     const dto = makeDto({
       write: {
         connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
-        trigger: 'event',
+        scheduled: false,
+        editable: true,
         batch: { groupBy: ['notAColumn'] },
       },
     });
@@ -44,11 +45,12 @@ describe('TableTemplatesService — validate() write.batch.groupBy', () => {
     await expect(service.create(dto)).rejects.toThrow(/write.batch.groupBy "notAColumn" is not one of the columns/);
   });
 
-  it('accepts a write.batch.groupBy made of real columns and carries trigger/batch into the saved entity', async () => {
+  it('accepts a write.batch.groupBy made of real columns and carries scheduled/batch into the saved entity', async () => {
     const dto = makeDto({
       write: {
         connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
-        trigger: 'schedule',
+        scheduled: true,
+        editable: true,
         batch: { groupBy: ['counterpartyTaxId', 'invoiceType'], maxBatchSize: 50 },
       },
     });
@@ -57,7 +59,8 @@ describe('TableTemplatesService — validate() write.batch.groupBy', () => {
 
     expect(saved.write).toEqual({
       connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
-      trigger: 'schedule',
+      scheduled: true,
+      editable: true,
       batch: { groupBy: ['counterpartyTaxId', 'invoiceType'], maxBatchSize: 50 },
     });
     expect(indexes.syncIndexes).toHaveBeenCalled();
@@ -68,7 +71,8 @@ describe('TableTemplatesService — validate() write.batch.groupBy', () => {
       idField: '',
       write: {
         connections: [{ connectionId: 'conn-1', method: 'PUT', path: '/invoices/{id}' }],
-        trigger: 'event',
+        scheduled: false,
+        editable: true,
       },
     });
 
@@ -82,10 +86,26 @@ describe('TableTemplatesService — validate() write.batch.groupBy', () => {
           { connectionId: 'conn-1', method: 'POST', path: '/a' },
           { connectionId: 'conn-1', method: 'PUT', path: '/b' },
         ],
-        trigger: 'event',
+        scheduled: false,
+        editable: true,
       },
     });
 
     await expect(service.create(dto)).rejects.toThrow(/duplicate rule for connection "conn-1"/);
+  });
+
+  it('rejects a write.connections list with two generic (connectionless) rules', async () => {
+    const dto = makeDto({
+      write: {
+        connections: [
+          { method: 'POST', path: '/a' },
+          { method: 'PUT', path: '/b' },
+        ],
+        scheduled: false,
+        editable: true,
+      },
+    });
+
+    await expect(service.create(dto)).rejects.toThrow(/only one generic \(connectionless\) rule/);
   });
 });

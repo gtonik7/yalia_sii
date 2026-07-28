@@ -3,22 +3,22 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService } from './table-rows.service';
+import type { SendPhase } from './table-rows.service';
 import type { TableTemplate } from './entities/table-template.entity';
-import { chunkRows, fetchQueuedRowsCapped, fetchRowsByIds, runWithConcurrency } from './write-sweep-query.util';
+import {
+  chunkRows,
+  fetchQueuedRowsCapped,
+  fetchRowsByIds,
+  fetchRowsByGroupIds,
+  fetchGroupMembers,
+  runWithConcurrency,
+  HARD_MAX_BATCH_SIZE,
+} from './write-sweep-query.util';
 import type { RowWithConnection } from './write-sweep-query.util';
 import { ParamList, isUuid } from '../core/sql/sql-params.util';
 
 /** Tope por defecto de filas `queued` sacadas por tabla en cada pasada del cron. */
 const DEFAULT_MAX_RECORDS_PER_POLL = 10_000;
-
-/**
- * Tope duro de filas por llamada HTTP saliente, independiente de
- * `write.batch.maxBatchSize` (que solo agrupa; el usuario podría no
- * configurarlo, o configurarlo por encima de esto). Sin este tope, un sweep de
- * hasta `DEFAULT_MAX_RECORDS_PER_POLL` filas en una partición sin `maxBatchSize`
- * iría entero en una sola petición al sistema externo.
- */
-const HARD_MAX_BATCH_SIZE = 1000;
 
 /**
  * Schedule-mode counterpart to WriteSweepProcessor: instead of one debounced
@@ -27,7 +27,7 @@ const HARD_MAX_BATCH_SIZE = 1000;
  * one go — there is no incoming groupValues to key off, so it discovers which
  * groups currently have `queued` rows before fetching/submitting each.
  *
- * Deliberately NOT restricted to `write.trigger==='schedule'` templates:
+ * Deliberately NOT restricted to `write.scheduled` templates:
  * BullMQ can silently drop an edit's debounce enqueue when it arrives while
  * the previous sweep job for that group is already `active` (mid-HTTP-call —
  * see the plan's open risk on same-jobId races), which would otherwise leave
@@ -107,9 +107,13 @@ export class TableWriteBatchService {
    * explicit extra confirmation before letting the user re-present those,
    * since the original callback could still land and race the resubmit. The
    * rest of the selection (only `'correcto'`/`null`) is counted as `skipped`
-   * so nothing already accepted is re-presented. Eligible rows are partitioned exactly
-   * like the queued sweeps (by ingestion connection and by
-   * `write.batch.groupBy`), so each partition ships through its own
+   * so nothing already accepted is re-presented.
+   *
+   * The selection is then EXPANDED to full groups: every still-sendable sibling
+   * sharing a `group_id` with a selected row is pulled in, so touching one row
+   * of a group ships the whole group together (never a partial combined
+   * record). Rows are partitioned exactly like the queued sweeps (by ingestion
+   * connection and by `group_id`), so each partition ships through its own
    * connection and honours `maxBatchSize`.
    */
   async submitByIds(
@@ -121,12 +125,20 @@ export class TableWriteBatchService {
     if (!template.write) {
       throw new BadRequestException(`Table "${tableKey}" has no write config to submit rows through`);
     }
-    const eligible = await fetchRowsByIds(this.dataSource, tableKey, ids, connectionId);
-    const skipped = ids.length - eligible.length;
-    if (!eligible.length) return { submitted: 0, skipped };
+    const selected = await fetchRowsByIds(this.dataSource, tableKey, ids, connectionId);
+    const skipped = ids.length - selected.length;
+    if (!selected.length) return { submitted: 0, skipped };
 
-    await this.partitionAndSubmit(template, eligible, 'manual');
-    return { submitted: eligible.length, skipped };
+    // Expand to full groups: bring in every still-sendable (`<> correcto`)
+    // sibling of the selected rows' groups so a group never goes out partial.
+    const groupIds = [...new Set(selected.map((r) => r.groupId).filter((g): g is string => !!g))];
+    const siblings = await fetchRowsByGroupIds(this.dataSource, tableKey, groupIds, connectionId);
+    const byId = new Map<string, RowWithConnection>();
+    for (const row of [...selected, ...siblings]) byId.set(row.id, row);
+    const expanded = [...byId.values()];
+
+    await this.partitionAndSubmit(template, expanded, 'manual');
+    return { submitted: expanded.length, skipped };
   }
 
   /**
@@ -145,18 +157,28 @@ export class TableWriteBatchService {
     trigger: 'schedule' | 'manual',
   ): Promise<void> {
     const groupBy = template.write?.batch?.groupBy ?? [];
+    const collapse = template.write?.batch?.collapse;
     const maxBatchSize = Math.min(template.write?.batch?.maxBatchSize ?? HARD_MAX_BATCH_SIZE, HARD_MAX_BATCH_SIZE);
 
+    // Se particiona por el `group_id` materializado (la clave estable calculada
+    // al guardar); para filas legacy sin `group_id` se recae en los valores
+    // recalculados de `groupBy` — así una plantilla que aún no ha re-estampado
+    // sus filas sigue agrupando igual que antes. También se particiona por
+    // `phase` (create/update, derivado de `submission_status`): una regla puede
+    // tener método/URL distintos para el primer envío y para una edición, así
+    // que un grupo con filas de ambas fases se divide en dos llamadas HTTP.
     const partitions = new Map<
       string,
-      { connectionId: string | null; groupValues: Record<string, string>; rows: { id: string; data: Record<string, unknown> }[] }
+      { connectionId: string | null; groupValues: Record<string, string>; groupId: string | null; phase: SendPhase; rows: { id: string; data: Record<string, unknown> }[] }
     >();
     for (const row of rows) {
       const connId = row.connectionId;
+      const phase: SendPhase = row.submissionStatus === 'revisado' ? 'update' : 'create';
       const groupValues: Record<string, string> = {};
       for (const col of groupBy) groupValues[col] = String(row.data[col] ?? '');
-      const key = `${connId ?? ''}::${JSON.stringify(groupValues)}`;
-      const bucket = partitions.get(key) ?? { connectionId: connId, groupValues, rows: [] };
+      const groupKey = row.groupId ?? JSON.stringify(groupValues);
+      const key = `${connId ?? ''}::${phase}::${groupKey}`;
+      const bucket = partitions.get(key) ?? { connectionId: connId, groupValues, groupId: row.groupId, phase, rows: [] };
       bucket.rows.push({ id: row.id, data: row.data });
       partitions.set(key, bucket);
     }
@@ -170,6 +192,26 @@ export class TableWriteBatchService {
     );
 
     for (const part of partitions.values()) {
+      // Tablas con `collapse`: el grupo entero se manda como UN registro
+      // combinado, incluyendo las hermanas ya enviadas/aceptadas como líneas de
+      // contexto (grupo completo), pero solo se marcan las filas de esta
+      // partición. No se trocea: un registro combinado no se parte en dos.
+      if (collapse && part.groupId) {
+        const members = await fetchGroupMembers(this.dataSource, template.key, part.connectionId, part.groupId);
+        const payloadRows = members.length ? members.map((r) => ({ id: r.id, data: r.data })) : part.rows;
+        const result = await this.rows.submitGroup(template, payloadRows, {
+          trigger,
+          groupValues: part.groupValues,
+          connectionId: part.connectionId,
+          markRowIds: part.rows.map((r) => r.id),
+          phase: part.phase,
+        });
+        if (result?.status === 'error') {
+          this.logger.warn(`Submit table=${template.key} batch=${result.batchId} failed: ${result.error}`);
+        }
+        continue;
+      }
+
       const chunks = chunkRows(part.rows, maxBatchSize);
       const concurrency = (part.connectionId && concurrencyByConn.get(part.connectionId)) || 1;
       const tasks = chunks.map((rowsChunk) => async () => {
@@ -177,6 +219,7 @@ export class TableWriteBatchService {
           trigger,
           groupValues: groupBy.length ? part.groupValues : null,
           connectionId: part.connectionId,
+          phase: part.phase,
         });
         if (result?.status === 'error') {
           this.logger.warn(`Submit table=${template.key} batch=${result.batchId} failed: ${result.error}`);

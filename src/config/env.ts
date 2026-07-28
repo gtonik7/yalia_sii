@@ -42,6 +42,21 @@ const envSchema = z.object({
     .string()
     .regex(/^[0-9a-fA-F]{64}$/, 'CREDENTIALS_ENC_KEY must be 32 bytes hex (64 chars)')
     .optional(),
+
+  // ── Backup / restore ──────────────────────────────────────────────────────
+  /** Directorio donde se guardan los artefactos `.siibak`. */
+  BACKUP_DIR: z.string().default('./backups'),
+  /** Cada cuánto revisa `BackupCron` los schedules pendientes. */
+  BACKUP_TICK_MS: z.coerce.number().int().positive().default(60_000),
+
+  // ── SMTP (envío de backups por correo) ────────────────────────────────────
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().positive().default(587),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().optional(),
+  // z.coerce.boolean('false') daría true; se parsea explícitamente el string.
+  SMTP_SECURE: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
 });
 
 export type Env = z.infer<typeof envSchema>;

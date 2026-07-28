@@ -21,10 +21,26 @@ export function satelliteControlQueueName(key: string = satelliteKey()): string 
   return `sat-${key}-control`;
 }
 
+/**
+ * Operaciones pesadas de mantenimiento (borrado masivo, count/stats/report exactos)
+ * ejecutadas en background para no bloquear el request HTTP más allá del techo de
+ * timeout del proxy del hub (30 s). El resultado se registra en `operation_runs`.
+ */
+export function satelliteMaintenanceQueueName(key: string = satelliteKey()): string {
+  return `sat-${key}-maintenance`;
+}
+
+/** Backup/restore (pg_dump/pg_restore) en background; el estado vive en `backup_runs`. */
+export function satelliteBackupQueueName(key: string = satelliteKey()): string {
+  return `sat-${key}-backup`;
+}
+
 export const QUEUES = {
   JOBS: satelliteJobsQueueName(),
   WRITE_EVENT: satelliteWriteEventQueueName(),
   CONTROL: satelliteControlQueueName(),
+  MAINTENANCE: satelliteMaintenanceQueueName(),
+  BACKUP: satelliteBackupQueueName(),
   // Inbound SII-result callback: fixed name (not per-satellite-key) since this
   // satellite's identity is permanently "sii" — mirrors the HUB_* queues below.
   SII_INBOUND: 'sii-inbound-results',

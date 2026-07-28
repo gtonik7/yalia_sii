@@ -5,13 +5,13 @@ import { TableTemplate } from './entities/table-template.entity';
 import { TableRow } from './entities/table-row.entity';
 import { TableWriteRun } from './entities/table-write-run.entity';
 import { TableDeleteEvent } from './entities/table-delete-event.entity';
+import { OperationRun } from './entities/operation-run.entity';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService } from './table-rows.service';
 import { TableIndexManagerService } from './table-index-manager.service';
 import { TableTemplatesController } from './table-templates.controller';
 import { TableDatasetBridge } from './table-dataset.bridge';
 import { IngestTableOperation } from './ingest-table.operation';
-import { WriteEventProcessor } from './write-event.processor';
 import { WriteCronService } from './write-cron.service';
 import { TableRetentionCron } from './table-retention.cron';
 import { TableWriteBatchService } from './table-write-batch.service';
@@ -26,6 +26,9 @@ import { TableCountController } from './table-count.controller';
 import { TableAggregateController } from './table-aggregate.controller';
 import { TableWriteRunService } from './table-write-run.service';
 import { TableWriteRunsDatasetProvider } from './table-write-runs-dataset.provider';
+import { OperationRunService } from './operation-run.service';
+import { OperationRunController } from './operation-run.controller';
+import { MaintenanceProcessor } from './maintenance.processor';
 import { OperationRegistryModule } from '../operations/operation-registry.module';
 import { ConnectionsModule } from '../connections/connections.module';
 import { OutboxModule } from '../outbox/outbox.module';
@@ -37,7 +40,13 @@ import { QUEUES } from '../core/queues/queues.constants';
  * dataset (DatasetsModule is @Global, so its registry is injectable here).
  */
 @Module({
-    imports: [TypeOrmModule.forFeature([TableTemplate, TableRow, TableWriteRun, TableDeleteEvent]), OperationRegistryModule, ConnectionsModule, OutboxModule, BullModule.registerQueue({ name: QUEUES.WRITE_EVENT })],
+    imports: [
+        TypeOrmModule.forFeature([TableTemplate, TableRow, TableWriteRun, TableDeleteEvent, OperationRun]),
+        OperationRegistryModule,
+        ConnectionsModule,
+        OutboxModule,
+        BullModule.registerQueue({ name: QUEUES.MAINTENANCE }),
+    ],
     controllers: [
         TableTemplatesController,
         TableWriteBatchController,
@@ -49,6 +58,7 @@ import { QUEUES } from '../core/queues/queues.constants';
         TableWriteSummaryController,
         TableCountController,
         TableAggregateController,
+        OperationRunController,
     ],
     providers: [
         TableTemplatesService,
@@ -56,12 +66,13 @@ import { QUEUES } from '../core/queues/queues.constants';
         TableIndexManagerService,
         TableDatasetBridge,
         IngestTableOperation,
-        WriteEventProcessor,
         WriteCronService,
         TableRetentionCron,
         TableWriteBatchService,
         TableWriteRunService,
         TableWriteRunsDatasetProvider,
+        OperationRunService,
+        MaintenanceProcessor,
     ],
     exports: [TableTemplatesService, TableRowsService],
 })

@@ -63,6 +63,14 @@ export class CapabilitiesController {
                     kind: 'domain-events',
                     requiresConnection: false,
                 },
+                {
+                    // Backup/restore programado de la BD (src/backup/): elegir tablas,
+                    // frecuencia (cron) y destinos (local/descarga/email), más restore.
+                    key: 'backups',
+                    label: 'Backups',
+                    kind: 'backups',
+                    requiresConnection: false,
+                },
             ],
             // Eventos de dominio que este satélite emite hacia `hub-events` (ver
             // `TableRowsService.buildEmittedEvent`). Deben quedar byte-idénticos a
@@ -74,9 +82,9 @@ export class CapabilitiesController {
             // `table.ingest` (push) needs no trigger.
             triggerableOperations: [
                 {
-                    // Schedule-mode counterpart to the debounced event-mode sweep: for
-                    // templates with write.trigger==='schedule', this is the only thing
-                    // that ever submits their queued rows.
+                    // Hub-driven sweep of a table's queued rows. Together with the
+                    // per-connection internal cron (scheduled tables) and manual
+                    // "Forzar envío", this is how queued rows ever get submitted.
                     key: 'table.write.batchSubmit',
                     label: 'Presentar registros pendientes (batch)',
                     scheduleManaged: 'hub',
@@ -159,6 +167,7 @@ export class CapabilitiesController {
                             connectionId: { type: 'string', title: 'Conexión' },
                             groupBy: { type: 'array', title: 'Dimensiones de agrupación' },
                             metrics: { type: 'array', title: 'Métricas numéricas' },
+                            having: { type: 'array', title: 'Filtros sobre los grupos (HAVING)' },
                         },
                     },
                 },

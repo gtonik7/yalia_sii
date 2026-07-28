@@ -112,6 +112,13 @@ export interface DatasetDescriptor {
      * getDetail() cuando pone esto en true.
      */
     hasDetail?: boolean;
+    /**
+     * When present, rows sharing the same `_batchId` were partitioned/sent
+     * together under `write.batch.groupBy` (these are that config's column
+     * keys) — the FE Records tab uses this to offer a collapsible group-by
+     * view. Absent when the dataset has no batch grouping configured.
+     */
+    batchGroupByColumns?: string[];
 }
 
 export interface DatasetQuery {

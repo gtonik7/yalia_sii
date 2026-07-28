@@ -20,7 +20,7 @@ export class TableWriteRunService {
     tableKey: string;
     connectionId?: string | null;
     connectionName?: string | null;
-    trigger: 'event' | 'schedule' | 'manual';
+    trigger: 'schedule' | 'manual';
     status: 'sent' | 'error';
     batchId?: string | null;
     groupValues?: Record<string, string> | null;
