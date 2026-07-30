@@ -1,6 +1,6 @@
-import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { DatasetRegistryService } from './dataset-registry.service';
-import { DatasetDescriptor, DatasetPage, DatasetSort, DatasetUpdateResult } from './dataset.types';
+import { DatasetCreateResult, DatasetDescriptor, DatasetPage, DatasetSort, DatasetUpdateResult } from './dataset.types';
 import { MgmtTokenGuard } from '../core/auth/mgmt-token.guard';
 
 const RESERVED_PARAMS = new Set(['connectionId', 'page', 'pageSize', 'search', 'sort', 'sortDir']);
@@ -101,6 +101,23 @@ export class DatasetsController {
       olderThanDays,
       filters: Object.keys(filters).length ? filters : undefined,
     });
+  }
+
+  /** Manually create one row: stored `queued`, submitted later by the write cron / "Forzar envío". Opt-in per provider. */
+  @Post(':key')
+  async create(
+    @Param('key') key: string,
+    @Query('connectionId') connectionId: string | undefined,
+    @Body() body: Record<string, unknown>,
+  ): Promise<DatasetCreateResult> {
+    const provider = await this.registry.resolve(key);
+    if (!provider.create) {
+      throw new BadRequestException(`Dataset '${key}' no admite alta de registros`);
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new BadRequestException('El cuerpo debe ser un objeto JSON');
+    }
+    return provider.create({ connectionId, data: body });
   }
 
   /** Edit one row: local save + optional write-back to the external system. Opt-in per provider. */

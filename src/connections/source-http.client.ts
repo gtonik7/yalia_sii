@@ -79,8 +79,8 @@ export class SourceHttpClient {
    */
   async send(
     conn: ResolvedSourceConnection,
-    req: { method: 'PUT' | 'PATCH' | 'POST'; path: string; query?: Record<string, string> },
-    body: unknown,
+    req: { method: 'PUT' | 'PATCH' | 'POST' | 'DELETE'; path: string; query?: Record<string, string> },
+    body?: unknown,
   ): Promise<{ status: number; data: unknown }> {
     const url = this.composeUrl(conn, { path: req.path, method: 'GET', query: req.query });
     let config: AxiosRequestConfig = {

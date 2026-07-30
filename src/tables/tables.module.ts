@@ -29,9 +29,12 @@ import { TableWriteRunsDatasetProvider } from './table-write-runs-dataset.provid
 import { OperationRunService } from './operation-run.service';
 import { OperationRunController } from './operation-run.controller';
 import { MaintenanceProcessor } from './maintenance.processor';
+import { TableRetentionPurgeController } from './table-retention-purge.controller';
+import { RetentionSchedulerService } from './retention-scheduler.service';
 import { OperationRegistryModule } from '../operations/operation-registry.module';
 import { ConnectionsModule } from '../connections/connections.module';
 import { OutboxModule } from '../outbox/outbox.module';
+import { RetentionModule } from '../retention/retention.module';
 import { QUEUES } from '../core/queues/queues.constants';
 
 /**
@@ -45,6 +48,7 @@ import { QUEUES } from '../core/queues/queues.constants';
         OperationRegistryModule,
         ConnectionsModule,
         OutboxModule,
+        RetentionModule,
         BullModule.registerQueue({ name: QUEUES.MAINTENANCE }),
     ],
     controllers: [
@@ -59,6 +63,7 @@ import { QUEUES } from '../core/queues/queues.constants';
         TableCountController,
         TableAggregateController,
         OperationRunController,
+        TableRetentionPurgeController,
     ],
     providers: [
         TableTemplatesService,
@@ -73,6 +78,7 @@ import { QUEUES } from '../core/queues/queues.constants';
         TableWriteRunsDatasetProvider,
         OperationRunService,
         MaintenanceProcessor,
+        RetentionSchedulerService,
     ],
     exports: [TableTemplatesService, TableRowsService],
 })

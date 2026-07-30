@@ -1,6 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { DatasetRegistryService } from '../datasets/dataset-registry.service';
-import { DatasetDescriptor, DatasetFilterDef, DatasetProvider, DatasetSource, DatasetUpdateParams } from '../datasets/dataset.types';
+import { DatasetCreateParams, DatasetDescriptor, DatasetFilterDef, DatasetProvider, DatasetSource, DatasetUpdateParams } from '../datasets/dataset.types';
 import { TableTemplate } from './entities/table-template.entity';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService } from './table-rows.service';
@@ -35,10 +35,14 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
             descriptor: this.toDescriptor(tpl),
             query: (params) => this.rows.query(tpl, params),
             deleteRows: (params) => this.rows.deleteRows(tpl, params),
-            // Only wired when the template declares `write` AND is `editable` —
-            // a table can send its ingested rows out (connections/scheduled/batch)
-            // while keeping the explorer's row detail read-only.
+            // `update` only wired when the template declares `write` AND is
+            // `editable` — a table can send its ingested rows out
+            // (connections/scheduled/batch) while keeping the explorer's row
+            // detail read-only. `create` has its own independent `creatable`
+            // gate: a table can allow manual creation without allowing edits
+            // to existing rows, or vice versa.
             ...(tpl.write?.editable ? { update: (p: DatasetUpdateParams) => this.rows.updateAndWrite(tpl, p.connectionId, p.id, p.data) } : {}),
+            ...(tpl.write?.creatable ? { create: (p: DatasetCreateParams) => this.rows.createRow(tpl, p.connectionId, p.data) } : {}),
         };
     }
 
@@ -61,24 +65,27 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
         // columns, not part of the user-declared template.columns) — only worth
         // exposing as filters when the table actually has write-back configured.
         if (t.write) {
-            filters.push(
-                {
-                    key: '_writeStatus',
-                    label: 'Estado envío',
-                    type: 'string',
-                    column: '_writeStatus',
-                    // Derived state (see WRITE_STATUS_CASE_SQL): transport/pipeline status,
-                    // distinct from the vendor's own SII outcome below. 'review' is a
-                    // manually-edited row awaiting the next send, kept apart from 'queued'
-                    // (arrived via ingest, never touched by hand).
-                    options: [
-                        { value: 'queued', label: 'En cola' },
-                        { value: 'review', label: 'Revisado' },
-                        { value: 'sent', label: 'Enviado' },
-                        { value: 'error', label: 'Error' },
-                    ],
-                },
-                {
+            filters.push({
+                key: '_writeStatus',
+                label: 'Estado envío',
+                type: 'string',
+                column: '_writeStatus',
+                // Derived state (see WRITE_STATUS_CASE_SQL): transport/pipeline status,
+                // distinct from the vendor's own SII outcome below. 'review' is a
+                // manually-edited row awaiting the next send, kept apart from 'queued'
+                // (arrived via ingest, never touched by hand).
+                options: [
+                    { value: 'queued', label: 'En cola' },
+                    { value: 'review', label: 'Revisado' },
+                    { value: 'sent', label: 'Enviado' },
+                    { value: 'error', label: 'Error' },
+                ],
+            });
+            // `showSiiStatus: false` opts a table out of the vendor-specific
+            // "Estado SII" vocabulary (see WriteConfig.showSiiStatus) — the
+            // filter, like the FE column, only makes sense when it's shown.
+            if (t.write.showSiiStatus !== false) {
+                filters.push({
                     key: '_submissionStatus',
                     label: 'Estado SII',
                     type: 'string',
@@ -94,7 +101,9 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
                         { value: 'INCORRECTO', label: 'Incorrecto' },
                         { value: 'ERROR', label: 'Error' },
                     ],
-                },
+                });
+            }
+            filters.push(
                 { key: '_updatedAt_from', label: 'Actualizado (desde)', type: 'date', column: '_updatedAt' },
                 { key: '_updatedAt_until', label: 'Actualizado (hasta)', type: 'date', column: '_updatedAt' }
             );
@@ -122,6 +131,10 @@ export class TableDatasetBridge implements DatasetSource, OnModuleInit {
             filters: filters.length ? filters : undefined,
             defaultSort: t.defaultSort ?? undefined,
             editable: t.write?.editable ? true : undefined,
+            creatable: t.write?.creatable ? true : undefined,
+            // Absent/`true` = shown (existing behavior); `false` hides "Estado SII"
+            // everywhere in the FE (see WriteConfig.showSiiStatus).
+            showSiiStatus: t.write ? t.write.showSiiStatus !== false : undefined,
             // A generic/fallback rule (no connectionId) means every connection can
             // write back — report "unrestricted" the same way an absent/empty list
             // already means for the FE (see writableHere in TableRecordsTab.tsx).

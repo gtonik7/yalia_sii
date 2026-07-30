@@ -54,6 +54,10 @@ export class CapabilitiesController {
                     label: 'Tablas',
                     kind: 'table-templates',
                     requiresConnection: false,
+                    // Opts into the hub FE's composite-idField picker (Campo ID as a
+                    // MultiSelect instead of a single Select) — yalia_sii tables support
+                    // `idFields` (composite upsert key) alongside plain `idField`.
+                    config: { compositeIdField: true },
                 },
                 {
                     // Observabilidad de solo lectura del outbox de eventos de dominio
@@ -69,6 +73,15 @@ export class CapabilitiesController {
                     key: 'backups',
                     label: 'Backups',
                     kind: 'backups',
+                    requiresConnection: false,
+                },
+                {
+                    // Retención de datos (src/retention/): configura ventana + cadencia de
+                    // purga de las tablas de trazas/ledger (delete-events, outbox, write-runs)
+                    // y permite forzar una purga en background con barra de progreso.
+                    key: 'retention',
+                    label: 'Retención',
+                    kind: 'retention',
                     requiresConnection: false,
                 },
             ],
@@ -98,6 +111,21 @@ export class CapabilitiesController {
                                 title: 'Tabla a presentar',
                                 description: 'key de la plantilla con write configurado',
                             },
+                        },
+                    },
+                },
+                {
+                    // Purga de retención en background (por lotes, con progreso). El target
+                    // (tabla de trazas/ledger) va en params.targetKey; ver RetentionService.
+                    key: 'retention.purge',
+                    label: 'Purgar retención (background)',
+                    scheduleManaged: 'code',
+                    requiresConnection: false,
+                    paramsSchema: {
+                        type: 'object',
+                        required: ['targetKey'],
+                        properties: {
+                            targetKey: { type: 'string', title: 'Target de retención' },
                         },
                     },
                 },

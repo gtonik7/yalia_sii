@@ -37,6 +37,22 @@ export class OperationRun {
     @Column({ type: 'jsonb', nullable: true })
     result!: Record<string, unknown> | null;
 
+    /** Filas objetivo estimadas al inicio (denominador de la barra de progreso). */
+    @Column({ type: 'int', default: 0 })
+    total!: number;
+
+    /** Filas ya procesadas/borradas. */
+    @Column({ type: 'int', default: 0 })
+    processed!: number;
+
+    /** Progreso 0-100 (pre-calculado para el FE). Sólo lo usan las ops largas (retención). */
+    @Column({ type: 'int', default: 0 })
+    progress!: number;
+
+    /** Fase legible actual (`counting`, `deleting`, `dropping-chunks`, `done`). */
+    @Column({ type: 'varchar', length: 32, nullable: true })
+    phase!: string | null;
+
     @Column({ type: 'text', nullable: true })
     error!: string | null;
 

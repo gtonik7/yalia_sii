@@ -107,6 +107,12 @@ export interface WriteConnectionRule {
     updatePath?: string;
     /** Override used instead of `query` for an edited row; absent = reuse `query`. */
     updateQuery?: Record<string, string>;
+    /** Override used instead of `method` when propagating a delete (phase='delete'); absent = default 'DELETE'. Only used when `WriteConfig.deleteEnabled`. */
+    deleteMethod?: 'PUT' | 'PATCH' | 'POST' | 'DELETE';
+    /** Override used instead of `path` when propagating a delete; absent = reuse `path`. Same `{id}` substitution rules apply (targets the specific external resource). */
+    deletePath?: string;
+    /** Override used instead of `query` when propagating a delete; absent = reuse `query`. */
+    deleteQuery?: Record<string, string>;
 }
 
 /**
@@ -140,6 +146,38 @@ export interface WriteConfig {
      * requires it on create/update.
      */
     editable?: boolean;
+    /**
+     * When `true`, the explorer exposes a "Nuevo registro" action that lets a
+     * user manually add a row (`TableRowsService.createRow`); the row lands
+     * `queued` and goes out via the connection's write cron or "Forzar envío"
+     * using the rule's create target, same as ingested rows — creating never
+     * sends inline. Independent of `editable`: a table can allow manual
+     * creation without allowing edits to existing rows, or vice versa.
+     * Off/absent = no manual creation (the historical behavior).
+     */
+    creatable?: boolean;
+    /**
+     * When `true`, a local deletion of a row (any path: row-selection, mass
+     * delete-by-filter, or retention purge) also propagates a DELETE request to
+     * the external system for each affected row, using the resolved rule's
+     * delete target (see `resolveSendTarget` phase 'delete': `deleteMethod`
+     * default 'DELETE', over `deletePath ?? path` with `{id}` substitution).
+     * Off/absent = deletes stay local (the historical behavior). Best-effort:
+     * an external failure is recorded to the write-run history but never blocks
+     * the local delete.
+     */
+    deleteEnabled?: boolean;
+    /**
+     * When `false`, the "Estado SII" column/field and every reference to it
+     * (grid column, hidden "Respuesta SII" column, detail dialog badge,
+     * SII message/error code, raw JSON response) are hidden from the explorer
+     * and edit form — purely a display gate, the underlying
+     * `submission_status`/`sii_response` columns and callback processing are
+     * unaffected. Default/absent = `true` (existing behavior): tables whose
+     * external system doesn't return an SII-style callback should set this to
+     * `false` so the vendor-specific vocabulary doesn't leak into their UI.
+     */
+    showSiiStatus?: boolean;
     /** Per-connection rules, plus at most one generic/fallback rule (see `WriteConnectionRule.connectionId`). */
     connections: WriteConnectionRule[];
     /** Present when queued rows must be partitioned before submitting. */
@@ -173,6 +211,19 @@ export class TableTemplate {
      */
     @Column({ type: 'varchar', length: 128, name: 'id_field', default: '' })
     idField!: string;
+
+    /**
+     * Composite upsert key: two or more column keys whose combined value
+     * uniquely identifies a row (e.g. invoice + line number), used instead of
+     * `idField` when set (mutually exclusive — `TableTemplatesService.validate`
+     * enforces it). Every SQL site that keys off `idField` (ingest's ON
+     * CONFLICT, the unique index, `getStats`' distinct count, `{id}`
+     * substitution) treats `idFields` as the same concept generalized to N
+     * columns joined instead of one. Null/empty = not composite (the
+     * historical single-`idField` behavior).
+     */
+    @Column({ type: 'jsonb', name: 'id_fields', nullable: true })
+    idFields!: string[] | null;
 
     /**
      * Column key that decides which duplicate wins the upsert: when set (and

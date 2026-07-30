@@ -90,6 +90,8 @@ export interface DatasetDescriptor {
     exactCountAvailable?: boolean;
     /** When true, the provider exposes update() and the FE shows an edit form. */
     editable?: boolean;
+    /** When true, the provider exposes create() and the FE shows a "Nuevo registro" action. */
+    creatable?: boolean;
     /**
      * When editable, the subset of connectionIds allowed to write back for this
      * dataset. Rows under any other connection are read-only. Omitted/absent =
@@ -119,6 +121,13 @@ export interface DatasetDescriptor {
      * view. Absent when the dataset has no batch grouping configured.
      */
     batchGroupByColumns?: string[];
+    /**
+     * When `false`, the FE hides the "Estado SII" column/field and every
+     * reference to it (grid column, detail dialog, edit form) for this
+     * dataset — purely a display gate. Absent/`true` = shown (existing
+     * behavior). Only meaningful when `editable`/write-back is configured.
+     */
+    showSiiStatus?: boolean;
 }
 
 export interface DatasetQuery {
@@ -167,6 +176,20 @@ export interface DatasetUpdateParams {
     data: Record<string, unknown>;
 }
 
+/** Params for manually creating a single row of a creatable dataset. */
+export interface DatasetCreateParams {
+    connectionId?: string;
+    data: Record<string, unknown>;
+}
+
+/** Result of a manual row creation: how the row landed (queued for later submission). */
+export interface DatasetCreateResult {
+    ok: boolean;
+    inserted: number;
+    upserted: number;
+    skippedStale: number;
+}
+
 /** Params for fetching the full detail of a single row (descriptor.hasDetail datasets). */
 export interface DatasetDetailParams {
     connectionId?: string;
@@ -191,6 +214,8 @@ export interface DatasetProvider {
     deleteRows?(params: DatasetDeleteParams): Promise<{ affected: number }>;
     /** Optional: providers that opt into editing (descriptor.editable) implement this. */
     update?(params: DatasetUpdateParams): Promise<DatasetUpdateResult>;
+    /** Optional: providers that opt into manual creation (descriptor.creatable) implement this. */
+    create?(params: DatasetCreateParams): Promise<DatasetCreateResult>;
     /**
      * Optional: providers that set descriptor.hasDetail implement this to return
      * the full row (including the heavy columns the list query omits) for a single

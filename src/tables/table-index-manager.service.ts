@@ -7,7 +7,7 @@ import { assertColumnKey, assertTableKey, sqlStringLiteral } from '../core/sql/s
 
 type IndexSpec =
   | { kind: 'filter'; tableKey: string; columnKey: string }
-  | { kind: 'unique-id'; tableKey: string; idField: string }
+  | { kind: 'unique-id'; tableKey: string; idFields: string[] }
   | { kind: 'group'; tableKey: string; groupBy: string[] };
 
 function shortHash(input: string): string {
@@ -21,10 +21,10 @@ function shortHash(input: string): string {
  * decision: one JSONB `data` column shared by every template).
  *
  * Index names are a deterministic hash of (tableKey, columnKey) — or
- * (tableKey, idField) for the unique index, which folds the *value* of
- * idField into the hash so renaming idField produces a different name (the
- * stale index gets dropped instead of silently no-op'ing against the wrong
- * expression via `IF NOT EXISTS`).
+ * (tableKey, idField(s)) for the unique index, which folds the *value* of
+ * idField/idFields into the hash so renaming it produces a different name
+ * (the stale index gets dropped instead of silently no-op'ing against the
+ * wrong expression via `IF NOT EXISTS`).
  */
 @Injectable()
 export class TableIndexManagerService {
@@ -54,12 +54,16 @@ export class TableIndexManagerService {
         columnKey: col.key,
       });
     }
-    if (tpl.idField) {
-      assertColumnKey(tpl.idField);
-      out.set(`ux_tr_${shortHash(`id:${tpl.key}:${tpl.idField}`)}`, {
+    const idFields = tpl.idFields?.length ? tpl.idFields : tpl.idField ? [tpl.idField] : [];
+    if (idFields.length) {
+      idFields.forEach(assertColumnKey);
+      // Single-field hash key stays byte-identical to before the composite
+      // generalization, so existing indexes aren't needlessly rebuilt.
+      const hashKey = idFields.length === 1 ? idFields[0] : idFields.join(',');
+      out.set(`ux_tr_${shortHash(`id:${tpl.key}:${hashKey}`)}`, {
         kind: 'unique-id',
         tableKey: tpl.key,
-        idField: tpl.idField,
+        idFields,
       });
     }
     if (tpl.write?.batch?.groupBy?.length) {
@@ -93,9 +97,10 @@ export class TableIndexManagerService {
             WHERE table_key = ${sqlStringLiteral(spec.tableKey)}
         `);
       } else if (spec.kind === 'unique-id') {
+        const idExprSql = spec.idFields.map((f) => `(data ->> ${sqlStringLiteral(f)})`).join(', ');
         await this.dataSource.query(`
           CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "${name}"
-            ON table_rows (connection_id, (data ->> ${sqlStringLiteral(spec.idField)}))
+            ON table_rows (connection_id, ${idExprSql})
             WHERE table_key = ${sqlStringLiteral(spec.tableKey)}
         `);
       } else {
@@ -112,7 +117,7 @@ export class TableIndexManagerService {
       if (spec.kind === 'unique-id') {
         this.logger.warn(`idField uniqueness violated building "${name}": ${message}`);
         throw new BadRequestException(
-          `idField "${spec.idField}" is not unique among existing rows of "${spec.tableKey}" (scoped by connection). ` +
+          `idField "${spec.idFields.join(', ')}" is not unique among existing rows of "${spec.tableKey}" (scoped by connection). ` +
             `Fix or de-duplicate the data before saving this template.`,
         );
       }

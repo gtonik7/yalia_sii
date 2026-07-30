@@ -3,8 +3,10 @@ import { Logger } from '@nestjs/common';
 import type { Job } from 'bullmq';
 import { QUEUES } from '../core/queues/queues.constants';
 import { OperationRunService, type MaintenanceJobData } from './operation-run.service';
+import type { OperationRun } from './entities/operation-run.entity';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService, type TableAggregateGroupBy, type TableAggregateHaving, type TableAggregateMetric } from './table-rows.service';
+import { RetentionService } from '../retention/retention.service';
 
 /**
  * Ejecuta en background las operaciones pesadas de tabla encoladas por sus controllers
@@ -21,6 +23,7 @@ export class MaintenanceProcessor extends WorkerHost {
         private readonly runs: OperationRunService,
         private readonly templates: TableTemplatesService,
         private readonly rows: TableRowsService,
+        private readonly retention: RetentionService,
     ) {
         super();
     }
@@ -33,7 +36,7 @@ export class MaintenanceProcessor extends WorkerHost {
 
         await this.runs.markRunning(runId);
         try {
-            const result = await this.dispatch(run.operation, run.params);
+            const result = await this.dispatch(run);
             await this.runs.markSuccess(runId, result);
             this.logger.log(`Maintenance op "${run.operation}" run=${runId} ok`);
         } catch (err) {
@@ -45,7 +48,20 @@ export class MaintenanceProcessor extends WorkerHost {
         }
     }
 
-    private async dispatch(operation: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    private async dispatch(run: OperationRun): Promise<Record<string, unknown>> {
+        const { operation, params } = run;
+
+        // Purga de retención: borrado largo por lotes con progreso real (ver RetentionService).
+        // No es por plantilla (opera sobre tablas físicas de trazas), así que se atiende
+        // antes de resolver el template.
+        if (operation === 'retention.purge') {
+            const targetKey = String(params.targetKey ?? '');
+            const deletedCount = await this.retention.executePurge(targetKey, (processed, total) =>
+                this.runs.updateProgress(run.id, processed, total),
+            );
+            return { deletedCount };
+        }
+
         const tableKey = String(params.tableKey ?? '');
         const template = await this.templates.getByKey(tableKey);
         const connectionId = params.connectionId as string | undefined;

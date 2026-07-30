@@ -26,9 +26,17 @@ export class TableTemplatesService {
         if (dto.idField && !keys.has(dto.idField)) {
             throw new BadRequestException(`idField "${dto.idField}" is not one of the columns`);
         }
+        if (dto.idFields?.length) {
+            if (dto.idField) {
+                throw new BadRequestException('idField and idFields are mutually exclusive — use one or the other');
+            }
+            for (const f of dto.idFields) {
+                if (!keys.has(f)) throw new BadRequestException(`idFields "${f}" is not one of the columns`);
+            }
+        }
         if (dto.recencyField) {
-            if (!dto.idField) {
-                throw new BadRequestException('recencyField requires idField to be set');
+            if (!dto.idField && !dto.idFields?.length) {
+                throw new BadRequestException('recencyField requires idField or idFields to be set');
             }
             if (!keys.has(dto.recencyField)) {
                 throw new BadRequestException(`recencyField "${dto.recencyField}" is not one of the columns`);
@@ -57,9 +65,9 @@ export class TableTemplatesService {
                     }
                     seenConnections.add(rule.connectionId);
                 }
-                if ((rule.path.includes('{id}') || rule.updatePath?.includes('{id}')) && !dto.idField) {
-                    // Without idField, {id} would resolve against the internal row id,
-                    // which is almost never a valid identifier for the external system.
+                if ((rule.path.includes('{id}') || rule.updatePath?.includes('{id}') || rule.deletePath?.includes('{id}')) && !dto.idField && !dto.idFields?.length) {
+                    // Without idField/idFields, {id} would resolve against the internal
+                    // row id, which is almost never a valid identifier for the external system.
                     throw new BadRequestException(
                         `write.connections["${label}"].path uses {id} but the table has no idField — it would resolve against the internal row id, not a valid external identifier`
                     );
@@ -123,7 +131,8 @@ export class TableTemplatesService {
             key: dto.key,
             label: dto.label,
             description: dto.description ?? null,
-            idField: dto.idField ?? '',
+            idField: dto.idFields?.length ? '' : dto.idField ?? '',
+            idFields: dto.idFields?.length ? dto.idFields : null,
             recencyField: dto.recencyField ?? '',
             columns: dto.columns.map((c) => ({
                 key: c.key,
@@ -145,6 +154,9 @@ export class TableTemplatesService {
                 ? {
                       scheduled: dto.write.scheduled,
                       editable: dto.write.editable,
+                      creatable: dto.write.creatable,
+                      deleteEnabled: dto.write.deleteEnabled,
+                      showSiiStatus: dto.write.showSiiStatus,
                       connections: dto.write.connections,
                       batch: dto.write.batch,
                   }

@@ -149,8 +149,8 @@ export class TableRowsService {
     ) {}
 
     /**
-     * Store one or more rows for a template. Upserts by `idField` (scoped to
-     * connectionId) when the template declares one; otherwise appends.
+     * Store one or more rows for a template. Upserts by `idField`/`idFields`
+     * (scoped to connectionId) when the template declares one; otherwise appends.
      */
     async ingest(template: TableTemplate, rows: Record<string, unknown>[], connectionId: string, traceId?: string): Promise<{ inserted: number; upserted: number; skippedStale: number }> {
         if (!rows.length) return { inserted: 0, upserted: 0, skippedStale: 0 };
@@ -167,17 +167,20 @@ export class TableRowsService {
         // invisible to both the cron sweep and manual force-submit (neither treats
         // NULL as sendable), with nothing to ever revisit and repair them.
         await this.dataSource.transaction(async (manager) => {
-            if (template.idField) {
-                // idField/table.key are already validated by the DTO when the template
+            const idFields = template.idFields?.length ? template.idFields : template.idField ? [template.idField] : [];
+            if (idFields.length) {
+                // idFields/table.key are already validated by the DTO when the template
                 // was saved (and by TableIndexManagerService when the unique index was
                 // built); re-checked here as defense in depth since they're interpolated
                 // as literal SQL text below — Postgres requires the ON CONFLICT partial
                 // index predicate to match the index's predicate verbatim, not bound.
-                assertColumnKey(template.idField);
+                // With a single field this reproduces the plain `(data ->> 'x')` expression
+                // byte-for-byte (matching the existing unique index), so single-idField
+                // templates are unaffected by the composite generalization below.
+                idFields.forEach(assertColumnKey);
                 assertTableKey(template.key);
                 if (template.recencyField) assertColumnKey(template.recencyField);
-                const idField = template.idField;
-                const idExpr = `(data ->> ${sqlStringLiteral(idField)})`;
+                const idExpr = idFields.map((f) => `(data ->> ${sqlStringLiteral(f)})`).join(', ');
                 const tableKeyLit = sqlStringLiteral(template.key);
                 const recencyField = template.recencyField;
                 // Numeric recency of a row: missing/non-numeric = -1, so an unstamped row
@@ -186,6 +189,14 @@ export class TableRowsService {
                     if (!recencyField) return 0;
                     const n = Number(data[recencyField]);
                     return Number.isFinite(n) ? n : -1;
+                };
+
+                // Composite key of a row: joined by a control char that can't appear in
+                // ingested JSON string values, so distinct field-value tuples never collide.
+                const keyOf = (data: Record<string, unknown>): string | undefined => {
+                    const parts = idFields.map((f) => data[f]);
+                    if (parts.some((v) => v === undefined || v === null || v === '')) return undefined;
+                    return parts.map((v) => String(v)).join('');
                 };
 
                 // Split rows: those with a usable id go through the batched ON CONFLICT
@@ -197,12 +208,11 @@ export class TableRowsService {
                 const withId = new Map<string, Record<string, unknown>>();
                 const withoutId: Record<string, unknown>[] = [];
                 for (const data of rows) {
-                    const idValue = data[idField];
-                    if (idValue === undefined || idValue === null || idValue === '') {
+                    const key = keyOf(data);
+                    if (key === undefined) {
                         withoutId.push(data);
                         continue;
                     }
-                    const key = String(idValue);
                     const prev = withId.get(key);
                     if (!prev || recencyOf(data) >= recencyOf(prev)) withId.set(key, data);
                 }
@@ -274,6 +284,35 @@ export class TableRowsService {
         return { inserted, upserted, skippedStale };
     }
 
+    /**
+     * Manually create one row for a write-enabled, `creatable` table (the
+     * "Nuevo registro" action). Mirrors ingest of a single row: the row lands
+     * `queued` and is sent later by the connection's write cron or an explicit
+     * "Forzar envío" using the rule's create target (method/path) — creation
+     * never sends inline, exactly like data-load ingest. Gated on `creatable`
+     * (independent of `editable`) and the connection resolving to a write rule.
+     */
+    async createRow(
+        template: TableTemplate,
+        connectionId: string | undefined,
+        data: Record<string, unknown>
+    ): Promise<{ ok: boolean; inserted: number; upserted: number; skippedStale: number }> {
+        if (!template.write) {
+            throw new BadRequestException(`Table "${template.key}" has no write config — manual record creation is not available`);
+        }
+        if (!template.write.creatable) {
+            throw new BadRequestException(`Table "${template.key}" does not allow manual record creation`);
+        }
+        if (!connectionId || !resolveWriteRule(template.write.connections, connectionId)) {
+            throw new BadRequestException(`Connection "${connectionId ?? ''}" is not allowed to write back for table "${template.key}"`);
+        }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new BadRequestException('El registro debe ser un objeto JSON');
+        }
+        const { inserted, upserted, skippedStale } = await this.ingest(template, [data], connectionId);
+        return { ok: true, inserted, upserted, skippedStale };
+    }
+
     /** Plain multi-VALUES append (no id to upsert on); returns the new row ids. */
     private async insertAppend(manager: EntityManager, tableKey: string, connectionId: string, rows: Record<string, unknown>[], traceId?: string): Promise<string[]> {
         if (!rows.length) return [];
@@ -308,9 +347,13 @@ export class TableRowsService {
         const [countRow]: { n: number }[] = await this.dataSource.query(`SELECT count(*)::int AS n FROM table_rows WHERE ${whereSql}`, p.all);
 
         let distinctIds: number | null = null;
-        if (template.idField) {
-            assertColumnKey(template.idField);
-            const idExpr = `(data ->> ${sqlStringLiteral(template.idField)})`;
+        const statsIdFields = template.idFields?.length ? template.idFields : template.idField ? [template.idField] : [];
+        if (statsIdFields.length) {
+            statsIdFields.forEach(assertColumnKey);
+            const parts = statsIdFields.map((f) => `(data ->> ${sqlStringLiteral(f)})`);
+            // A single field stays a plain scalar expression; 2+ fields form a row
+            // value so `count(DISTINCT (...))` counts distinct field-value tuples.
+            const idExpr = parts.length === 1 ? parts[0] : `(${parts.join(', ')})`;
             const [row]: { n: number }[] = await this.dataSource.query(`SELECT count(DISTINCT ${idExpr})::int AS n FROM table_rows WHERE ${whereSql}`, p.all);
             distinctIds = row.n;
         }
@@ -803,12 +846,18 @@ export class TableRowsService {
         if (params.connectionId) where.push(`connection_id = ${p.push(params.connectionId)}`);
         // Captured alongside the affected count so the ledger can say WHICH ids
         // were removed, not just how many — see recordDeleteEvent.
-        const returning = template.idField ? ` RETURNING (data ->> ${sqlStringLiteral(template.idField)}) AS record_id` : '';
+        const deleteIdFields = template.idFields?.length ? template.idFields : template.idField ? [template.idField] : [];
+        const returning = deleteIdFields.length
+            ? ` RETURNING ${deleteIdFields.length === 1 ? `(data ->> ${sqlStringLiteral(deleteIdFields[0])})` : `concat_ws(':', ${deleteIdFields.map((f) => `(data ->> ${sqlStringLiteral(f)})`).join(', ')})`} AS record_id`
+            : '';
 
         if (params.ids?.length) {
             const validIds = params.ids.filter(isUuid);
             if (!validIds.length) return { affected: 0 };
             where.push(`id = ANY(${p.push(validIds)}::uuid[])`);
+            // Propagate a DELETE to the external system for each affected row BEFORE
+            // removing it locally (the row's data is needed to target the resource).
+            await this.propagateExternalDeletes(template, where.join(' AND '), p.all);
             const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${where.join(' AND ')}${returning}`, p.all);
             const [affected, recordIds] = this.deleteResult(result, returning);
             await this.recordDeleteEvent(template.key, params.connectionId, affected, 'ids', recordIds);
@@ -818,6 +867,7 @@ export class TableRowsService {
         if (params.olderThanDays !== undefined) {
             const cutoff = new Date(Date.now() - params.olderThanDays * 24 * 3600 * 1000);
             where.push(`created_at < ${p.push(cutoff)}`);
+            await this.propagateExternalDeletes(template, where.join(' AND '), p.all);
             const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${where.join(' AND ')}${returning}`, p.all);
             const [affected, recordIds] = this.deleteResult(result, returning);
             await this.recordDeleteEvent(template.key, params.connectionId, affected, 'retention', recordIds);
@@ -827,6 +877,7 @@ export class TableRowsService {
         const nonEmptyFilters = Object.fromEntries(Object.entries(params.filters ?? {}).filter(([, v]) => v !== ''));
         if (Object.keys(nonEmptyFilters).length) {
             this.applyFilters(template, nonEmptyFilters, where, p);
+            await this.propagateExternalDeletes(template, where.join(' AND '), p.all);
             const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${where.join(' AND ')}${returning}`, p.all);
             const [affected, recordIds] = this.deleteResult(result, returning);
             await this.recordDeleteEvent(template.key, params.connectionId, affected, 'bulk', recordIds);
@@ -850,6 +901,91 @@ export class TableRowsService {
         const [rows, affected] = result as [{ record_id: string | null }[], number];
         if (!returning) return [affected, null];
         return [affected, rows.map((r) => r.record_id).filter((id): id is string => id != null)];
+    }
+
+    /**
+     * When the template opts in (`write.deleteEnabled`), propagate a DELETE to the
+     * external system for every row matched by a pending local deletion — called
+     * from all three `deleteRows` paths (ids/retention/bulk) BEFORE the local
+     * DELETE, since each request needs the row's data to target its resource.
+     * Rows are grouped by ingest connection (the rule supplies method/path/query,
+     * the connection supplies baseUrl/auth), one request per row with `{id}`
+     * substituted from `idField` (fallback internal id). Best-effort: outcomes
+     * (incl. failures) are logged to the write-run history but never throw, so a
+     * local delete/purge is never blocked by an external error.
+     *
+     * Cost note: one HTTP DELETE per row — a large retention/bulk purge fans out
+     * accordingly. Acceptable because bulk runs in the background (operation_runs,
+     * see maintenance.processor) and retention on the daily cron; row-selection
+     * deletes are bounded by the UI selection.
+     */
+    private async propagateExternalDeletes(template: TableTemplate, whereSql: string, whereParams: unknown[]): Promise<void> {
+        if (!template.write?.deleteEnabled) return;
+        const rows: { id: string; data: Record<string, unknown>; connection_id: string | null }[] = await this.dataSource.query(
+            `SELECT id, data, connection_id FROM table_rows WHERE ${whereSql}`,
+            whereParams
+        );
+        if (!rows.length) return;
+
+        const byConnection = new Map<string, { id: string; data: Record<string, unknown> }[]>();
+        for (const r of rows) {
+            const cid = r.connection_id ?? '';
+            const bucket = byConnection.get(cid);
+            if (bucket) bucket.push({ id: r.id, data: r.data });
+            else byConnection.set(cid, [{ id: r.id, data: r.data }]);
+        }
+
+        for (const [connectionId, group] of byConnection) {
+            const rule = resolveWriteRule(template.write.connections, connectionId || null);
+            // No rule for this connection (or no connection at all) — nothing to
+            // target externally; the local delete still proceeds.
+            if (!rule) continue;
+            let conn;
+            try {
+                conn = await this.connections.resolveById(connectionId);
+            } catch {
+                continue;
+            }
+            const target = resolveSendTarget(rule, 'delete');
+            for (const row of group) {
+                const batchId = randomUUID();
+                const path = applyIdSubstitution(target.path, row, template.idField, template.idFields);
+                try {
+                    const { status, data } = await this.client.send(conn, { method: target.method, path, query: target.query });
+                    const ok = status >= 200 && status < 300;
+                    await this.recordRun({
+                        template,
+                        connectionId,
+                        connectionName: conn.name,
+                        trigger: 'manual',
+                        groupValues: null,
+                        rowCount: 1,
+                        status: ok ? 'sent' : 'error',
+                        httpStatus: status,
+                        errorMessage: ok ? undefined : `External system responded ${status}: ${truncate(safeStringify(data))}`,
+                        batchId,
+                        responseBody: ok ? undefined : (data ?? null),
+                    });
+                } catch (err) {
+                    const responseBody = axiosResponseBody(err);
+                    const base = err instanceof Error ? err.message : String(err);
+                    const message = responseBody !== null ? `${base}: ${truncate(safeStringify(responseBody))}` : base;
+                    await this.recordRun({
+                        template,
+                        connectionId,
+                        connectionName: conn.name,
+                        trigger: 'manual',
+                        groupValues: null,
+                        rowCount: 1,
+                        status: 'error',
+                        httpStatus: null,
+                        errorMessage: message,
+                        batchId,
+                        responseBody,
+                    });
+                }
+            }
+        }
     }
 
     /**
@@ -1253,21 +1389,49 @@ function resolveWriteRule(connections: WriteConnectionRule[], connectionId: stri
     return connections.find((r) => r.connectionId === connectionId) ?? connections.find((r) => !r.connectionId);
 }
 
-/** A row's send phase: 'create' for its first-ever send (submission_status='queued'), 'update' for an edit (submission_status='revisado'). */
-export type SendPhase = 'create' | 'update';
+/**
+ * A row's send phase: 'create' for its first-ever send (submission_status='queued'),
+ * 'update' for an edit (submission_status='revisado'), 'delete' for propagating a
+ * local deletion to the external system (only when `write.deleteEnabled`).
+ */
+export type SendPhase = 'create' | 'update' | 'delete';
+
+/** Effective method allowed per phase — only the 'delete' phase can resolve to 'DELETE'. */
+type SendMethod = 'PUT' | 'PATCH' | 'POST' | 'DELETE';
 
 /**
  * Resolves the effective method/path/query for a rule given the send phase.
- * `phase === 'update'` uses the rule's `update*` overrides, falling back to
- * the base `method`/`path`/`query` field-by-field when an override is absent
- * — so a rule with no `update*` fields at all behaves identically for both
- * phases (the pre-existing behavior).
+ * `phase === 'update'` uses the rule's `update*` overrides and `phase ===
+ * 'delete'` the `delete*` overrides (method defaulting to 'DELETE'), each
+ * falling back to the base `method`/`path`/`query` field-by-field when an
+ * override is absent — so a rule with no phase overrides behaves identically
+ * to the base send (the pre-existing behavior for create/update).
  */
-function resolveSendTarget(rule: WriteConnectionRule, phase: SendPhase): { method: WriteConnectionRule['method']; path: string; query?: Record<string, string> } {
+function resolveSendTarget(rule: WriteConnectionRule, phase: SendPhase): { method: SendMethod; path: string; query?: Record<string, string> } {
     if (phase === 'update') {
         return { method: rule.updateMethod ?? rule.method, path: rule.updatePath ?? rule.path, query: rule.updateQuery ?? rule.query };
     }
+    if (phase === 'delete') {
+        return { method: rule.deleteMethod ?? 'DELETE', path: rule.deletePath ?? rule.path, query: rule.deleteQuery ?? rule.query };
+    }
     return { method: rule.method, path: rule.path, query: rule.query };
+}
+
+/**
+ * Substitutes `{id}` in a write-back path with a row's external identifier —
+ * `data[idField]`, or `data[idFields[0]]-data[idFields[1]]-...` when the
+ * template declares a composite key, falling back to the row's internal id
+ * when any part is missing. URL-encoded so the value is a single safe path
+ * segment. Used by the per-row delete propagation, where each request must
+ * target one specific external resource (unlike create/update, which batch
+ * many rows to one URL).
+ */
+function applyIdSubstitution(path: string, row: { id: string; data: Record<string, unknown> }, idField: string, idFields?: string[] | null): string {
+    if (!path.includes('{id}')) return path;
+    const fields = idFields?.length ? idFields : idField ? [idField] : [];
+    const parts = fields.map((f) => row.data[f]);
+    const idValue = fields.length && parts.every((v) => v !== undefined && v !== null && v !== '') ? parts.map((v) => String(v)).join('-') : row.id;
+    return path.replace(/\{id\}/g, encodeURIComponent(idValue));
 }
 
 /**

@@ -627,6 +627,136 @@ describe('TableRowsService — updateAndWrite (row edit + submission queuing)', 
   });
 });
 
+describe('TableRowsService — createRow (manual insert, queued)', () => {
+  let service: TableRowsService;
+  let sendMock: jest.Mock;
+  const conn: ResolvedSourceConnection = {
+    id: 'conn-1', name: 'SII', clave: null, baseUrl: 'https://sii.test',
+    authType: 'bearer', credentials: { token: 't' }, defaultHeaders: {}, active: true,
+  };
+
+  beforeEach(() => {
+    sendMock = jest.fn();
+    service = new TableRowsService(
+      dataSource,
+      { resolveById: jest.fn().mockResolvedValue(conn) } as never,
+      { send: sendMock } as never,
+      { record: async () => ({}) } as never,
+      { emit: async () => {} } as never,
+    );
+  });
+
+  it('inserts the row queued and never sends inline (creation mirrors ingest)', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, creatable: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+
+    const res = await service.createRow(tpl, 'conn-1', { id: 'NEW1', status: 'draft' });
+
+    expect(res).toMatchObject({ ok: true, inserted: 1 });
+    expect(sendMock).not.toHaveBeenCalled();
+    const [state] = await submissionState('orders');
+    expect(state.submission_status).toBe('queued');
+    expect(await submissionStatusForDataId('orders', 'NEW1')).toBe('queued');
+  });
+
+  it('allows creation on a non-editable table when creatable is set independently', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: false, creatable: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+
+    const res = await service.createRow(tpl, 'conn-1', { id: 'NEW2', status: 'draft' });
+
+    expect(res).toMatchObject({ ok: true, inserted: 1 });
+  });
+
+  it('rejects when the table is not creatable, without inserting anything', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, creatable: false, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+    await expect(service.createRow(tpl, 'conn-1', { id: 'X', status: 'draft' })).rejects.toThrow(/does not allow manual record creation/);
+    expect(await service.query(tpl, query({ connectionId: 'conn-1' }))).toMatchObject({ total: 0 });
+  });
+
+  it('rejects when the connection has no write rule', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, creatable: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+    await expect(service.createRow(tpl, 'conn-B', { id: 'X' })).rejects.toThrow(/not allowed to write back/);
+  });
+});
+
+describe('TableRowsService — deleteRows external DELETE propagation (write.deleteEnabled)', () => {
+  let service: TableRowsService;
+  let sendMock: jest.Mock;
+  const conn: ResolvedSourceConnection = {
+    id: 'conn-1', name: 'SII', clave: null, baseUrl: 'https://sii.test',
+    authType: 'bearer', credentials: { token: 't' }, defaultHeaders: {}, active: true,
+  };
+
+  function build() {
+    sendMock = jest.fn().mockResolvedValue({ status: 204, data: null });
+    service = new TableRowsService(
+      dataSource,
+      { resolveById: jest.fn().mockResolvedValue(conn) } as never,
+      { send: sendMock } as never,
+      { record: async () => ({}) } as never,
+      { emit: async () => {} } as never,
+    );
+  }
+
+  it('sends one DELETE per row with {id} substituted, then deletes locally', async () => {
+    build();
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, deleteEnabled: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices', deletePath: '/invoices/{id}' }] },
+    });
+    await service.ingest(tpl, [{ id: 'A1', status: 'x' }], 'conn-1', 't');
+    const rowId = await rowIdForDataId('orders', 'A1');
+
+    const res = await service.deleteRows(tpl, { connectionId: 'conn-1', ids: [rowId] });
+
+    expect(res.affected).toBe(1);
+    expect(sendMock).toHaveBeenCalledWith(conn, { method: 'DELETE', path: '/invoices/A1', query: undefined });
+    expect(await service.query(tpl, query({ connectionId: 'conn-1' }))).toMatchObject({ total: 0 });
+  });
+
+  it('deletes locally even when the external DELETE fails (best-effort)', async () => {
+    build();
+    sendMock.mockRejectedValue(new Error('boom'));
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, deleteEnabled: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices', deletePath: '/invoices/{id}' }] },
+    });
+    await service.ingest(tpl, [{ id: 'A1', status: 'x' }], 'conn-1', 't');
+    const rowId = await rowIdForDataId('orders', 'A1');
+
+    const res = await service.deleteRows(tpl, { connectionId: 'conn-1', ids: [rowId] });
+
+    expect(res.affected).toBe(1);
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(await service.query(tpl, query({ connectionId: 'conn-1' }))).toMatchObject({ total: 0 });
+  });
+
+  it('does not propagate a DELETE when deleteEnabled is off', async () => {
+    build();
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+    await service.ingest(tpl, [{ id: 'A1', status: 'x' }], 'conn-1', 't');
+    const rowId = await rowIdForDataId('orders', 'A1');
+
+    await service.deleteRows(tpl, { connectionId: 'conn-1', ids: [rowId] });
+
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('TableRowsService — submitGroup (batch send core)', () => {
   let service: TableRowsService;
   let sendMock: jest.Mock;

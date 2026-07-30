@@ -153,6 +153,22 @@ export class WriteConnectionRuleDto {
     @IsOptional()
     @IsObject()
     updateQuery?: Record<string, string>;
+
+    /** Override for delete propagation (phase='delete'); absent = default 'DELETE'. */
+    @IsOptional()
+    @IsIn(['PUT', 'PATCH', 'POST', 'DELETE'])
+    deleteMethod?: 'PUT' | 'PATCH' | 'POST' | 'DELETE';
+
+    /** Override for delete propagation; absent = reuse `path`. */
+    @IsOptional()
+    @IsString()
+    @MinLength(1)
+    deletePath?: string;
+
+    /** Override for delete propagation; absent = reuse `query`. */
+    @IsOptional()
+    @IsObject()
+    deleteQuery?: Record<string, string>;
 }
 
 export class WriteConfigDto {
@@ -163,6 +179,21 @@ export class WriteConfigDto {
     /** true = rows are editable in the explorer; false = read-only detail view, but sending still applies. */
     @IsBoolean()
     editable!: boolean;
+
+    /** true = the explorer exposes "Nuevo registro" for manual creation; independent of `editable`. */
+    @IsOptional()
+    @IsBoolean()
+    creatable?: boolean;
+
+    /** true = a local delete also propagates a DELETE to the external system for each affected row (best-effort). */
+    @IsOptional()
+    @IsBoolean()
+    deleteEnabled?: boolean;
+
+    /** false = hide the "Estado SII" column/field and every reference to it in the explorer and edit form; default/absent = true. */
+    @IsOptional()
+    @IsBoolean()
+    showSiiStatus?: boolean;
 
     @IsArray()
     @ArrayMinSize(1)
@@ -192,6 +223,12 @@ export class UpsertTableTemplateDto {
     @IsOptional()
     @IsString()
     idField?: string;
+
+    /** Composite upsert key (2+ column keys); mutually exclusive with `idField`. */
+    @IsOptional()
+    @IsArray()
+    @IsString({ each: true })
+    idFields?: string[];
 
     /** Column whose greatest numeric value decides which duplicate id wins ingest ("newest wins"). Requires idField. */
     @IsOptional()
