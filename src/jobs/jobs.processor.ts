@@ -49,6 +49,7 @@ export class JobsProcessor extends WorkerHost {
           defaultMethod: envelope.defaultMethod,
           batchId: envelope.batchId,
           params: envelope.params,
+          loadMeta: envelope.loadMeta,
         });
       } catch (err) {
         const e = err as Error;

@@ -115,10 +115,14 @@ export interface DatasetDescriptor {
      */
     hasDetail?: boolean;
     /**
-     * When present, rows sharing the same `_batchId` were partitioned/sent
-     * together under `write.batch.groupBy` (these are that config's column
-     * keys) — the FE Records tab uses this to offer a collapsible group-by
-     * view. Absent when the dataset has no batch grouping configured.
+     * When present, rows sharing the same `_groupId` belong to one
+     * write.batch.groupBy unit (these are that config's column keys) and must
+     * be treated as an atomic block — selection, force-send and delete all
+     * act on the whole group. The FE Records tab uses this to offer a
+     * collapsible group-by view. `_groupId` is stable from ingest time
+     * (unlike `_batchId`, a transport correlation id only stamped once a
+     * group is actually sent — null while queued/staged). Absent when the
+     * dataset has no batch grouping configured.
      */
     batchGroupByColumns?: string[];
     /**

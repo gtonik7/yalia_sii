@@ -6,14 +6,16 @@ import { OperationRunService, type MaintenanceJobData } from './operation-run.se
 import type { OperationRun } from './entities/operation-run.entity';
 import { TableTemplatesService } from './table-templates.service';
 import { TableRowsService, type TableAggregateGroupBy, type TableAggregateHaving, type TableAggregateMetric } from './table-rows.service';
+import { TableWriteBatchService } from './table-write-batch.service';
 import { RetentionService } from '../retention/retention.service';
 
 /**
  * Ejecuta en background las operaciones pesadas de tabla encoladas por sus controllers
- * (borrado masivo, count/stats/report exactos), escribiendo el desenlace en `operation_runs`.
- * La lógica de negocio vive intacta en `TableRowsService`; aquí sólo se despacha por
- * `operation` y se traduce a resultado. Los parámetros ya fueron validados por el controller
- * antes de encolar (confirm/allowBulkDelete/filtros no vacíos, etc.).
+ * (borrado masivo, count/stats/report exactos, forzar envío de una selección),
+ * escribiendo el desenlace en `operation_runs`. La lógica de negocio vive intacta en
+ * `TableRowsService`/`TableWriteBatchService`; aquí sólo se despacha por `operation` y se
+ * traduce a resultado. Los parámetros ya fueron validados por el controller antes de
+ * encolar (confirm/allowBulkDelete/filtros no vacíos, etc.).
  */
 @Processor(QUEUES.MAINTENANCE, { concurrency: Number(process.env.MAINTENANCE_CONCURRENCY) || 2 })
 export class MaintenanceProcessor extends WorkerHost {
@@ -23,6 +25,7 @@ export class MaintenanceProcessor extends WorkerHost {
         private readonly runs: OperationRunService,
         private readonly templates: TableTemplatesService,
         private readonly rows: TableRowsService,
+        private readonly writeBatch: TableWriteBatchService,
         private readonly retention: RetentionService,
     ) {
         super();
@@ -68,6 +71,11 @@ export class MaintenanceProcessor extends WorkerHost {
         const filters = params.filters as Record<string, string> | undefined;
 
         switch (operation) {
+            case 'table.write.submitRows': {
+                const ids = (params.ids as string[] | undefined) ?? [];
+                const { submitted, skipped } = await this.writeBatch.submitByIds(tableKey, ids, connectionId);
+                return { submitted, skipped };
+            }
             case 'table.bulkDelete': {
                 const nonEmptyFilters = Object.fromEntries(Object.entries(filters ?? {}).filter(([, v]) => v !== ''));
                 const { affected } = await this.rows.deleteRows(template, { connectionId, filters: nonEmptyFilters });

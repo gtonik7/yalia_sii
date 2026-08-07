@@ -49,6 +49,25 @@ export class IngestTableOperation implements OperationHandler, OnModuleInit {
       return err('UNKNOWN_TABLE', `No template registered for tableKey "${tableKey}"`);
     }
 
+    // Evento de sello de carga (fin de fichero fragmentado): no lleva filas útiles,
+    // solo `loadComplete` + `totalBatches` en el envelope. Fija el total esperado y,
+    // si ya han llegado todos los lotes, pasa la carga entera `staged → queued`. Se
+    // maneja ANTES del no-op de "0 filas" porque su payload es justamente records:[].
+    const loadMeta = ctx.loadMeta;
+    if (loadMeta?.loadComplete && loadMeta.loadId) {
+      try {
+        await this.rows.sealLoad(template, loadMeta.loadId, loadMeta.totalBatches ?? 0, ctx.connectionId || null);
+        this.logger.log(
+          `Load seal table=${tableKey} load=${loadMeta.loadId} totalBatches=${loadMeta.totalBatches ?? 0} trace=${ctx.traceId}`,
+        );
+        return { status: 'ok', data: { tableKey, sealed: loadMeta.loadId, totalBatches: loadMeta.totalBatches ?? 0 } };
+      } catch (e) {
+        const message = e instanceof Error ? e.message : 'seal failed';
+        this.logger.error(`Load seal failed table=${tableKey} load=${loadMeta.loadId} trace=${ctx.traceId}: ${message}`);
+        return err('SEAL_FAILED', message);
+      }
+    }
+
     const rows = extractRows(payload);
     if (!rows.length) {
       // A well-formed event that legitimately parses to zero rows (e.g. a
@@ -73,7 +92,7 @@ export class IngestTableOperation implements OperationHandler, OnModuleInit {
     }
 
     try {
-      const res = await this.rows.ingest(template, rows, ctx.connectionId, ctx.traceId);
+      const res = await this.rows.ingest(template, rows, ctx.connectionId, ctx.traceId, loadMeta);
       this.logger.log(
         `Ingested table=${tableKey} inserted=${res.inserted} upserted=${res.upserted} skippedStale=${res.skippedStale} trace=${ctx.traceId}`,
       );

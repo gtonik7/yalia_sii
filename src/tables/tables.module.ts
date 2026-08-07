@@ -14,6 +14,7 @@ import { TableDatasetBridge } from './table-dataset.bridge';
 import { IngestTableOperation } from './ingest-table.operation';
 import { WriteCronService } from './write-cron.service';
 import { TableRetentionCron } from './table-retention.cron';
+import { StaleLoadCron } from './stale-load.cron';
 import { TableWriteBatchService } from './table-write-batch.service';
 import { TableWriteBatchController } from './table-write-batch.controller';
 import { TableWriteSubmitController } from './table-write-submit.controller';
@@ -73,6 +74,7 @@ import { QUEUES } from '../core/queues/queues.constants';
         IngestTableOperation,
         WriteCronService,
         TableRetentionCron,
+        StaleLoadCron,
         TableWriteBatchService,
         TableWriteRunService,
         TableWriteRunsDatasetProvider,

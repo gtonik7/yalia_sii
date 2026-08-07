@@ -61,6 +61,9 @@ export async function fetchRowsByIds(
     // Case-insensitive: internal statuses ('queued'/'pending'/'error') are
     // lowercase, vendor callback literals ('CORRECTO'/'ERROR') are uppercase.
     `lower(submission_status) <> 'correcto'`,
+    // 'staged' rows belong to a load that isn't complete yet — never sendable,
+    // not even by force-submit, so a group never goes out before its load seals.
+    `submission_status <> 'staged'`,
   ];
   if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
   const rows: RowRecord[] = await dataSource.query(
@@ -88,8 +91,39 @@ export async function fetchQueuedRowsCapped(
   const p = new ParamList();
   const where = [`table_key = ${p.push(tableKey)}`, `submission_status IN ('queued', 'revisado')`];
   if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
+  const limitParam = p.push(limit);
+  // Group-atomic cap: en vez de un `LIMIT` plano sobre filas (que podía cortar un
+  // grupo a caballo del tope y enviarlo a medias), se eligen GRUPOS ENTEROS hasta
+  // el tope. Los grupos se ordenan por su fila más antigua (`min(created_at)`,
+  // igual que el orden previo) y se van sumando sus tamaños; se incluye un grupo
+  // solo si el acumulado ≤ límite, y SIEMPRE al menos el primero (para no bloquear
+  // un grupo único mayor que el tope — luego `maxBatchSize`/`HARD_MAX_BATCH_SIZE`
+  // lo trocea en llamadas ≤1000). `grp = coalesce(group_id, id::text)`: las filas
+  // sin grupo cuentan cada una como su propio grupo unitario. Así una carga sellada
+  // nunca se parte por el tope del cron.
   const rows: RowRecord[] = await dataSource.query(
-    `SELECT id, data, connection_id, group_id, submission_status FROM table_rows WHERE ${where.join(' AND ')} ORDER BY created_at LIMIT ${p.push(limit)}`,
+    `WITH candidate AS (
+       SELECT id, data, connection_id, group_id, submission_status, created_at,
+              coalesce(group_id, id::text) AS grp
+       FROM table_rows
+       WHERE ${where.join(' AND ')}
+     ),
+     grp AS (
+       SELECT grp, min(created_at) AS grp_min, count(*) AS grp_count
+       FROM candidate GROUP BY grp
+     ),
+     ranked AS (
+       SELECT grp, grp_count,
+              sum(grp_count) OVER (ORDER BY grp_min, grp) AS cum,
+              row_number() OVER (ORDER BY grp_min, grp) AS rn
+       FROM grp
+     ),
+     chosen AS (
+       SELECT grp FROM ranked WHERE cum <= ${limitParam} OR rn = 1
+     )
+     SELECT c.id, c.data, c.connection_id, c.group_id, c.submission_status
+     FROM candidate c JOIN chosen ch ON ch.grp = c.grp
+     ORDER BY c.created_at`,
     p.all,
   );
   return rows.map(toRowWithConnection);
@@ -115,6 +149,8 @@ export async function fetchRowsByGroupIds(
     `group_id = ANY(${p.push(groupIds)})`,
     `submission_status IS NOT NULL`,
     `lower(submission_status) <> 'correcto'`,
+    // Excluir 'staged': una carga incompleta nunca se expande a un force-submit.
+    `submission_status <> 'staged'`,
   ];
   if (connectionId) where.push(`connection_id = ${p.push(connectionId)}`);
   const rows: RowRecord[] = await dataSource.query(

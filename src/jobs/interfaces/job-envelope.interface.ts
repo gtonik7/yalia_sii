@@ -1,3 +1,5 @@
+import type { LoadMeta } from '../../operations/operation.interface';
+
 // Must stay in sync with yalia_hub/src/core/egress/adapters/satellite-egress.adapter.ts
 export interface SatelliteJobEnvelope {
   traceId: string;
@@ -9,6 +11,8 @@ export interface SatelliteJobEnvelope {
   idempotencyKey: string;
   batchId?: string;
   params?: Record<string, unknown>;
+  /** Metadatos de carga para el sellado de lotes (ver LoadMeta / IngestTableOperation). */
+  loadMeta?: LoadMeta;
   callback?: {
     traceId: string;
     destinationKey: string;

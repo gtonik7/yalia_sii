@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { Logger } from '@nestjs/common';
 import { TableRowsService } from './table-rows.service';
 import { TableWriteBatchService } from './table-write-batch.service';
+import { fetchQueuedRowsCapped, fetchRowsByIds, fetchRowsByGroupIds } from './write-sweep-query.util';
 import { SiiResultProcessor } from '../callbacks/sii-result.processor';
 import { TableRow } from './entities/table-row.entity';
 import { TableColumnDef, TableTemplate } from './entities/table-template.entity';
@@ -757,6 +758,52 @@ describe('TableRowsService — deleteRows external DELETE propagation (write.del
   });
 });
 
+describe('TableRowsService — deleteRows group-block safety (write.batch.groupBy)', () => {
+  let service: TableRowsService;
+
+  beforeEach(() => {
+    service = new TableRowsService(dataSource, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
+  });
+
+  it('deleting one id pulls in every sibling sharing the same group_id', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }], batch: { groupBy: ['status'] } },
+    });
+    await service.ingest(tpl, [
+      { id: 'A1', status: 'grp-x' },
+      { id: 'A2', status: 'grp-x' },
+      { id: 'A3', status: 'grp-y' },
+    ], 'conn-1', 'trace-1');
+    const idOfA1 = await rowIdForDataId('orders', 'A1');
+
+    const res = await service.deleteRows(tpl, { connectionId: 'conn-1', ids: [idOfA1] });
+
+    // A1 + its group-y sibling A2 (same status → same group_id) go together; A3 (different group) survives.
+    expect(res.affected).toBe(2);
+    const remaining = await service.query(tpl, query({ connectionId: 'conn-1' }));
+    expect(remaining.rows.map((r) => r.id)).toEqual(['A3']);
+  });
+
+  it('ungrouped tables (no batch.groupBy) delete exactly the given ids, unchanged behavior', async () => {
+    const tpl = makeTemplate({
+      idField: 'id',
+      write: { scheduled: true, editable: true, connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }] },
+    });
+    await service.ingest(tpl, [
+      { id: 'A1', status: 'x' },
+      { id: 'A2', status: 'x' },
+    ], 'conn-1', 'trace-1');
+    const idOfA1 = await rowIdForDataId('orders', 'A1');
+
+    const res = await service.deleteRows(tpl, { connectionId: 'conn-1', ids: [idOfA1] });
+
+    expect(res.affected).toBe(1);
+    const remaining = await service.query(tpl, query({ connectionId: 'conn-1' }));
+    expect(remaining.rows.map((r) => r.id)).toEqual(['A2']);
+  });
+});
+
 describe('TableRowsService — submitGroup (batch send core)', () => {
   let service: TableRowsService;
   let sendMock: jest.Mock;
@@ -1188,18 +1235,20 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
     expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it('caps each sweep at write.batch.maxRecordsPerPoll rows, leaving the rest queued for the next pass', async () => {
+  it('never splits a group across the maxRecordsPerPoll cap — includes whole groups only, cap applied across groups', async () => {
     const cappedTpl = makeTemplate({
       idField: 'id',
       write: {
         scheduled: true,
         connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
-        // groupBy so we also prove the per-table cap applies across groups, not per group.
+        // groupBy so we prove the per-table cap includes WHOLE groups, never cutting one.
         batch: { groupBy: ['counterpartyTaxId'], maxRecordsPerPoll: 3 },
       },
     });
     build();
     templatesStub.getByKey.mockResolvedValue(cappedTpl);
+    // Two groups of 2. Cap=3: one whole group (2) fits; adding the second (→4) would
+    // exceed the cap, so it waits — a group is never cut just to fill the cap exactly.
     await service.ingest(
       cappedTpl,
       [
@@ -1207,7 +1256,6 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
         { id: 'A2', counterpartyTaxId: 'B123' },
         { id: 'A3', counterpartyTaxId: 'C456' },
         { id: 'A4', counterpartyTaxId: 'C456' },
-        { id: 'A5', counterpartyTaxId: 'C456' },
       ],
       'conn-1',
       't1',
@@ -1215,17 +1263,29 @@ describe('TableWriteBatchService — schedule-mode full sweep (table.write.batch
 
     await batchService.submitAllQueued(cappedTpl);
 
-    // Exactly 3 rows go out this pass (total across all groups), 2 stay queued.
+    // Exactly one whole group went out (2 rows), the other stays fully queued.
     const totalSent = sendMock.mock.calls.reduce((n, call) => n + payloadRows(call).length, 0);
-    expect(totalSent).toBe(3);
+    expect(totalSent).toBe(2);
     const state = await submissionState('orders');
-    expect(state.filter((r) => r.submission_status === 'pending')).toHaveLength(3);
-    expect(state.filter((r) => r.submission_status === 'queued')).toHaveLength(2);
+    const pending = state.filter((r) => r.submission_status === 'pending');
+    const queued = state.filter((r) => r.submission_status === 'queued');
+    expect(pending).toHaveLength(2);
+    expect(queued).toHaveLength(2);
+    // The two sent rows belong to the SAME group; the two queued to the other — never a mix.
+    const distinctGroups = async (ids: string[]): Promise<number> => {
+      const rows: { tax: string }[] = await dataSource.query(
+        `SELECT DISTINCT data->>'counterpartyTaxId' AS tax FROM table_rows WHERE id = ANY($1::uuid[])`,
+        [ids],
+      );
+      return rows.length;
+    };
+    expect(await distinctGroups(pending.map((r) => r.id))).toBe(1);
+    expect(await distinctGroups(queued.map((r) => r.id))).toBe(1);
 
-    // Next pass drains the remaining 2.
+    // Next pass drains the remaining group.
     await batchService.submitAllQueued(cappedTpl);
     const after = await submissionState('orders');
-    expect(after.filter((r) => r.submission_status === 'pending')).toHaveLength(5);
+    expect(after.filter((r) => r.submission_status === 'pending')).toHaveLength(4);
     expect(after.filter((r) => r.submission_status === 'queued')).toHaveLength(0);
   });
 
@@ -1668,5 +1728,88 @@ describe('SiiResultProcessor — inbound SII-result correlation by internal_ref'
 
     const [row] = await dataSource.query(`SELECT data FROM table_rows WHERE id = $1`, [rowId]);
     expect(row.data).toEqual({ status: 'draft' });
+  });
+});
+
+describe('TableRowsService — load staging & sealing (batched ingestion units)', () => {
+  let service: TableRowsService;
+  const stagedTpl = makeTemplate({
+    idField: 'id',
+    write: {
+      scheduled: true,
+      connections: [{ connectionId: 'conn-1', method: 'POST', path: '/invoices' }],
+      batch: { groupBy: ['counterpartyTaxId'] },
+    },
+  });
+
+  beforeEach(async () => {
+    await dataSource.query('TRUNCATE table_loads');
+    await dataSource.query('TRUNCATE table_load_batches');
+    service = new TableRowsService(dataSource, {} as never, {} as never, { record: async () => ({}) } as never, { emit: async () => {} } as never);
+  });
+
+  const statusOf = (dataId: string) => submissionStatusForDataId('orders', dataId);
+
+  it('lands rows staged (not sweepable) and only flips them to queued when the load seals', async () => {
+    // Two batches of one load; the group ('B123') straddles the batch boundary.
+    await service.ingest(stagedTpl, [{ id: 'A1', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L1', batchIndex: 0 });
+    await service.ingest(stagedTpl, [{ id: 'A2', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L1', batchIndex: 1 });
+
+    expect(await statusOf('A1')).toBe('staged');
+    expect(await statusOf('A2')).toBe('staged');
+    // Nothing is sweepable while the load is incomplete.
+    expect(await fetchQueuedRowsCapped(dataSource, 'orders', 10_000)).toHaveLength(0);
+
+    // Seal: 2 batches expected, both arrived → the whole load flips atomically.
+    await service.sealLoad(stagedTpl, 'L1', 2, 'conn-1');
+    expect(await statusOf('A1')).toBe('queued');
+    expect(await statusOf('A2')).toBe('queued');
+    expect(await fetchQueuedRowsCapped(dataSource, 'orders', 10_000)).toHaveLength(2);
+  });
+
+  it('seals correctly when the seal event arrives BEFORE the last batch (order-independent)', async () => {
+    await service.ingest(stagedTpl, [{ id: 'A1', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L2', batchIndex: 0 });
+    // Seal arrives before batch 1: expected is set, but received (1) < 2 → no flip yet.
+    await service.sealLoad(stagedTpl, 'L2', 2, 'conn-1');
+    expect(await statusOf('A1')).toBe('staged');
+    // Last batch lands → completes the count → flips the whole load.
+    await service.ingest(stagedTpl, [{ id: 'A2', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L2', batchIndex: 1 });
+    expect(await statusOf('A1')).toBe('queued');
+    expect(await statusOf('A2')).toBe('queued');
+  });
+
+  it('does not double-count a re-delivered batch (same batch_index) — stays unsealed until the real last batch', async () => {
+    await service.ingest(stagedTpl, [{ id: 'A1', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L3', batchIndex: 0 });
+    // Batch 0 re-delivered (retry) — must not count as a second distinct batch.
+    await service.ingest(stagedTpl, [{ id: 'A1', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L3', batchIndex: 0 });
+    await service.sealLoad(stagedTpl, 'L3', 2, 'conn-1');
+    expect(await statusOf('A1')).toBe('staged'); // still incomplete: only batch 0 truly arrived
+    await service.ingest(stagedTpl, [{ id: 'A2', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L3', batchIndex: 1 });
+    expect(await statusOf('A1')).toBe('queued');
+    expect(await statusOf('A2')).toBe('queued');
+  });
+
+  it('routes rows of an already-sealed load straight to queued (late/duplicate batch after seal)', async () => {
+    await service.ingest(stagedTpl, [{ id: 'A1', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L4', batchIndex: 0 });
+    await service.sealLoad(stagedTpl, 'L4', 1, 'conn-1');
+    expect(await statusOf('A1')).toBe('queued');
+    // A late batch for the same (already sealed) load must not re-stage anything.
+    await service.ingest(stagedTpl, [{ id: 'A9', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L4', batchIndex: 5 });
+    expect(await statusOf('A9')).toBe('queued');
+  });
+
+  it('an event without loadMeta lands queued directly (webhook / small file — no regression)', async () => {
+    await service.ingest(stagedTpl, [{ id: 'W1', counterpartyTaxId: 'B123' }], 'conn-1', 't');
+    expect(await statusOf('W1')).toBe('queued');
+  });
+
+  it('force-submit never expands into staged rows (neither by id nor by group sibling)', async () => {
+    await service.ingest(stagedTpl, [{ id: 'S1', counterpartyTaxId: 'B123' }], 'conn-1', 't', { loadId: 'L5', batchIndex: 0 });
+    const rowId = await rowIdForDataId('orders', 'S1');
+    expect(await fetchRowsByIds(dataSource, 'orders', [rowId])).toHaveLength(0);
+    const [{ group_id }]: { group_id: string }[] = await dataSource.query(
+      `SELECT group_id FROM table_rows WHERE (data->>'id') = 'S1'`,
+    );
+    expect(await fetchRowsByGroupIds(dataSource, 'orders', [group_id])).toHaveLength(0);
   });
 });

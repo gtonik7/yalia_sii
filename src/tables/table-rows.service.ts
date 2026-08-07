@@ -11,6 +11,7 @@ import { DomainEmitterService } from '../outbox/domain-emitter.service';
 import type { DomainEvent } from '../outbox/domain-event.types';
 import { assertColumnKey, assertTableKey, escapeLike, isUuid, ParamList, sqlStringLiteral } from '../core/sql/sql-params.util';
 import { buildCollapsedPayloadItem } from './write-collapse.util';
+import type { LoadMeta } from '../operations/operation.interface';
 
 /** Loosely matches ISO 8601 date/datetime strings — guards the timestamptz cast in query()'s date-range filter. */
 const ISO_DATETIME_RE = String.raw`^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$`;
@@ -69,6 +70,7 @@ interface TableRowRow {
     submission_status: string | null;
     sii_response: Record<string, unknown> | null;
     batch_id: string | null;
+    group_id: string | null;
 }
 
 /** One table's KPI breakdown — see `TableRowsService.getWriteSummary()`. */
@@ -152,7 +154,7 @@ export class TableRowsService {
      * Store one or more rows for a template. Upserts by `idField`/`idFields`
      * (scoped to connectionId) when the template declares one; otherwise appends.
      */
-    async ingest(template: TableTemplate, rows: Record<string, unknown>[], connectionId: string, traceId?: string): Promise<{ inserted: number; upserted: number; skippedStale: number }> {
+    async ingest(template: TableTemplate, rows: Record<string, unknown>[], connectionId: string, traceId?: string, loadMeta?: LoadMeta): Promise<{ inserted: number; upserted: number; skippedStale: number }> {
         if (!rows.length) return { inserted: 0, upserted: 0, skippedStale: 0 };
         let inserted = 0;
         let upserted = 0;
@@ -278,7 +280,17 @@ export class TableRowsService {
             // internal cron (or an explicit force-submit). Only an *edit* (updateAndWrite)
             // triggers an immediate event send. Rows are created in batch, so a send here
             // would be a batch-on-create, which is exactly what we don't want.
-            await this.markQueued(manager, template, affectedIds);
+            //
+            // Con `loadMeta.loadId` (lote de una carga fragmentada, p.ej. un fichero SFTP
+            // >= 1MB troceado en N eventos) las filas aterrizan `staged` (NO barribles)
+            // hasta que la carga está completa, para no enviar el grupo a medias. Sin
+            // `loadId` (evento único: webhook / fichero pequeño / alta manual) siguen
+            // aterrizando `queued` directamente — comportamiento intacto.
+            if (loadMeta?.loadId) {
+                await this.stageLoadRows(manager, template, affectedIds, connectionId, loadMeta);
+            } else {
+                await this.markQueued(manager, template, affectedIds);
+            }
         });
 
         return { inserted, upserted, skippedStale };
@@ -793,7 +805,7 @@ export class TableRowsService {
 
         const [rows, countRows] = await Promise.all([
             this.dataSource.query(
-                `SELECT id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, sii_response, batch_id
+                `SELECT id, data, created_at, updated_at, write_status, write_error, last_written_at, external_ref, submission_status, sii_response, batch_id, group_id
          FROM table_rows WHERE ${whereSql} ORDER BY ${orderBy} LIMIT ${limitPh} OFFSET ${offsetPh}`,
                 p.all
             ) as Promise<TableRowRow[]>,
@@ -814,7 +826,13 @@ export class TableRowsService {
                 _externalRef: r.external_ref,
                 _submissionStatus: r.submission_status,
                 _siiResponse: r.sii_response,
+                // `_batchId` (transport UUID, see submitGroup) is only stamped at
+                // actual send time — null while `queued`/`staged`. `_groupId` is
+                // the stable write.batch.groupBy key materialized at ingest, so
+                // it's what the FE must group/select/delete by even before a row
+                // has ever been sent.
                 _batchId: r.batch_id,
+                _groupId: r.group_id,
             })),
             total,
             page: params.page,
@@ -850,15 +868,30 @@ export class TableRowsService {
         const returning = deleteIdFields.length
             ? ` RETURNING ${deleteIdFields.length === 1 ? `(data ->> ${sqlStringLiteral(deleteIdFields[0])})` : `concat_ws(':', ${deleteIdFields.map((f) => `(data ->> ${sqlStringLiteral(f)})`).join(', ')})`} AS record_id`
             : '';
+        // Grouped tables (write.batch.groupBy) must never lose a sibling: any
+        // matched row pulls its whole `group_id` in too, so a group is always
+        // deleted as one block (mirrors the "send as one block" invariant —
+        // see fetchGroupMembers — applied now to deletion instead of submission).
+        const grouped = !!template.write?.batch?.groupBy?.length;
+        // Captured before any branch appends its own match condition (id/date/
+        // filters) below — must stay table_key(+connectionId) only, or the OR's
+        // second branch would re-apply the match condition and never actually
+        // reach outside it to pull in non-matching siblings.
+        const scopeWhere = where.join(' AND ');
+        const withGroupExpansion = (matchWhere: string): string =>
+            grouped
+                ? `(${matchWhere}) OR (${scopeWhere} AND group_id IS NOT NULL AND group_id IN (SELECT group_id FROM table_rows WHERE ${matchWhere} AND group_id IS NOT NULL))`
+                : matchWhere;
 
         if (params.ids?.length) {
             const validIds = params.ids.filter(isUuid);
             if (!validIds.length) return { affected: 0 };
             where.push(`id = ANY(${p.push(validIds)}::uuid[])`);
+            const finalWhere = withGroupExpansion(where.join(' AND '));
             // Propagate a DELETE to the external system for each affected row BEFORE
             // removing it locally (the row's data is needed to target the resource).
-            await this.propagateExternalDeletes(template, where.join(' AND '), p.all);
-            const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${where.join(' AND ')}${returning}`, p.all);
+            await this.propagateExternalDeletes(template, finalWhere, p.all);
+            const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${finalWhere}${returning}`, p.all);
             const [affected, recordIds] = this.deleteResult(result, returning);
             await this.recordDeleteEvent(template.key, params.connectionId, affected, 'ids', recordIds);
             return { affected };
@@ -867,8 +900,9 @@ export class TableRowsService {
         if (params.olderThanDays !== undefined) {
             const cutoff = new Date(Date.now() - params.olderThanDays * 24 * 3600 * 1000);
             where.push(`created_at < ${p.push(cutoff)}`);
-            await this.propagateExternalDeletes(template, where.join(' AND '), p.all);
-            const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${where.join(' AND ')}${returning}`, p.all);
+            const finalWhere = withGroupExpansion(where.join(' AND '));
+            await this.propagateExternalDeletes(template, finalWhere, p.all);
+            const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${finalWhere}${returning}`, p.all);
             const [affected, recordIds] = this.deleteResult(result, returning);
             await this.recordDeleteEvent(template.key, params.connectionId, affected, 'retention', recordIds);
             return { affected };
@@ -877,8 +911,9 @@ export class TableRowsService {
         const nonEmptyFilters = Object.fromEntries(Object.entries(params.filters ?? {}).filter(([, v]) => v !== ''));
         if (Object.keys(nonEmptyFilters).length) {
             this.applyFilters(template, nonEmptyFilters, where, p);
-            await this.propagateExternalDeletes(template, where.join(' AND '), p.all);
-            const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${where.join(' AND ')}${returning}`, p.all);
+            const finalWhere = withGroupExpansion(where.join(' AND '));
+            await this.propagateExternalDeletes(template, finalWhere, p.all);
+            const result = await this.dataSource.query(`DELETE FROM table_rows WHERE ${finalWhere}${returning}`, p.all);
             const [affected, recordIds] = this.deleteResult(result, returning);
             await this.recordDeleteEvent(template.key, params.connectionId, affected, 'bulk', recordIds);
             return { affected };
@@ -1374,6 +1409,111 @@ export class TableRowsService {
          WHERE id = ANY($1::uuid[])`,
             [ids, status]
         );
+    }
+
+    /**
+     * Igual que `markQueued` pero deja las filas en `submission_status='staged'`
+     * (NO barrible) y estampa `load_id`, para retener una carga fragmentada hasta
+     * que esté completa. `group_id` se materializa igual (así el flip a 'queued'
+     * ya deja los grupos listos para agrupar). No toca filas ya avanzadas
+     * ('pending'/enviadas/terminal) — solo re-estadía las que aún no salieron.
+     */
+    private async markStaged(manager: EntityManager, template: TableTemplate, ids: string[], loadId: string): Promise<void> {
+        if (!template.write || !ids.length) return;
+        const groupIdSql = buildGroupIdSql(template.write.batch?.groupBy ?? []);
+        await manager.query(
+            `UPDATE table_rows
+         SET submission_status = 'staged', load_id = $2, batch_id = NULL, sii_response = NULL,
+             write_status = NULL, write_error = NULL, last_written_at = NULL,
+             group_id = ${groupIdSql}
+         WHERE id = ANY($1::uuid[])
+           AND (submission_status IS NULL OR submission_status IN ('staged', 'queued', 'revisado'))`,
+            [ids, loadId]
+        );
+    }
+
+    /**
+     * Estadía las filas recién ingeridas de un lote de carga y lleva la
+     * contabilidad de la carga (todo dentro de la transacción de `ingest`):
+     *
+     *  1. Asegura la fila `table_loads` y la bloquea (`FOR UPDATE`) para
+     *     serializar los lotes/sello concurrentes de la misma carga.
+     *  2. Si la carga YA está sellada (lote tardío/reintento tras el sello), las
+     *     filas van directas a `queued` — la carga estaba completa.
+     *  3. Si no, `markStaged`, registra el `batch_index` (idempotente) e intenta
+     *     sellar por conteo: si `expected_batches` ya se conoce (lo fijó el sello)
+     *     y han llegado todos, hace el flip atómico `staged → queued`.
+     */
+    private async stageLoadRows(manager: EntityManager, template: TableTemplate, ids: string[], connectionId: string, loadMeta: LoadMeta): Promise<void> {
+        const loadId = loadMeta.loadId;
+        await manager.query(
+            `INSERT INTO table_loads (load_id, table_key, connection_id)
+         VALUES ($1, $2, $3) ON CONFLICT (load_id) DO NOTHING`,
+            [loadId, template.key, connectionId || null]
+        );
+        const [load]: { sealed_at: Date | null }[] = await manager.query(
+            `SELECT sealed_at FROM table_loads WHERE load_id = $1 FOR UPDATE`,
+            [loadId]
+        );
+        if (load?.sealed_at) {
+            await this.markQueued(manager, template, ids);
+            return;
+        }
+        await this.markStaged(manager, template, ids, loadId);
+        if (typeof loadMeta.batchIndex === 'number') {
+            await manager.query(
+                `INSERT INTO table_load_batches (load_id, batch_index)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                [loadId, loadMeta.batchIndex]
+            );
+        }
+        await this.flipLoadIfComplete(manager, loadId);
+    }
+
+    /**
+     * Evento de sello de una carga (fin de fichero fragmentado): fija el total de
+     * lotes esperado y, si ya han llegado todos, sella. Idempotente y seguro ante
+     * cualquier orden de llegada (el sello puede llegar antes o después que los
+     * lotes — son sagas independientes). Cada camino toma el `FOR UPDATE` de la
+     * fila de carga, así que exactamente una transacción hace el flip.
+     */
+    async sealLoad(template: TableTemplate, loadId: string, totalBatches: number, connectionId: string | null): Promise<void> {
+        await this.dataSource.transaction(async (manager) => {
+            await manager.query(
+                `INSERT INTO table_loads (load_id, table_key, connection_id, expected_batches)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (load_id) DO UPDATE
+               SET expected_batches = EXCLUDED.expected_batches,
+                   connection_id = COALESCE(table_loads.connection_id, EXCLUDED.connection_id)`,
+                [loadId, template.key, connectionId, totalBatches]
+            );
+            await this.flipLoadIfComplete(manager, loadId);
+        });
+    }
+
+    /**
+     * Núcleo del sellado, race-safe: bloquea la fila de carga, y si aún no está
+     * sellada, se conoce `expected_batches` y han llegado todos los lotes, pasa
+     * TODA la carga `staged → queued` de una vez y marca `sealed_at`. El
+     * `FOR UPDATE` garantiza que solo una transacción concurrente cruza el umbral.
+     */
+    private async flipLoadIfComplete(manager: EntityManager, loadId: string): Promise<void> {
+        const [load]: { expected_batches: number | null; sealed_at: Date | null }[] = await manager.query(
+            `SELECT expected_batches, sealed_at FROM table_loads WHERE load_id = $1 FOR UPDATE`,
+            [loadId]
+        );
+        if (!load || load.sealed_at || load.expected_batches == null) return;
+        const [{ received }]: { received: number }[] = await manager.query(
+            `SELECT count(*)::int AS received FROM table_load_batches WHERE load_id = $1`,
+            [loadId]
+        );
+        if (received < load.expected_batches) return;
+        await manager.query(
+            `UPDATE table_rows SET submission_status = 'queued'
+         WHERE load_id = $1 AND submission_status = 'staged'`,
+            [loadId]
+        );
+        await manager.query(`UPDATE table_loads SET sealed_at = now() WHERE load_id = $1`, [loadId]);
     }
 }
 
